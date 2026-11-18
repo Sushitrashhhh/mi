@@ -1,0 +1,35 @@
+[package]
+name = "mi-bin"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "mi"
+path = "src/main.rs"
+
+[dependencies]
+mi-core = { path = "../mi-core" }
+
+# CLI argument parsing
+clap = { version = "4.6", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1.54", features = ["full"] }
+
+# Streams (for StreamExt)
+futures = "0.3"
+
+# WebSocket server (for serve command)
+axum = { version = "0.8", features = ["ws"] }
+
+# IDs
+uuid = { version = "1", features = ["v4"] }
+
+# Colored terminal output
+colored = "3"
+
+# For reading password input (set-gemini-key)
+rpassword = "7"
+
+# Logging
+tracing = "0.1"

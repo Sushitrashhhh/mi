@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/mi-core", "crates/mi-bin"]
+resolver = "2"

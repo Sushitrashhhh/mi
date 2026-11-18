@@ -1,0 +1,15 @@
+[core]
+host = "127.0.0.1"
+port = 7777
+autonomy = "normal"            # "normal" | "dry_run" | "paused"
+max_steps = 12
+
+[models]                       # fill from `mi doctor` output; never hardcode in code
+fast = ""
+default = ""
+deep = ""
+vision = ""
+live = ""
+tts = ""
+embed = ""
+local = "llama3.2:3b"

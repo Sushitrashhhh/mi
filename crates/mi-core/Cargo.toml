@@ -1,0 +1,44 @@
+[package]
+name = "mi-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.54", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+
+# HTTP client for Gemini REST API
+reqwest = { version = "0.13", features = ["json", "stream"] }
+
+# WebSocket server
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# OS credential store for API keys
+keyring = { version = "4.2", features = ["windows-native-keyring-store"] }
+
+# Structured logging to JSONL
+tracing = "0.1"
+
+# IDs and timestamps
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Home directory
+dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"
+tokio-test = "0.4"

@@ -1,4 +1,12 @@
+# Rust
+/target/
+*.pdb
+
+# Secrets
 .env
+*.key
+
+# Legacy Python artifacts
 .venv/
 __pycache__/
 *.pyc
@@ -11,6 +19,6 @@ build/
 *.dist/
 *.onefile-build/
 node_modules/
-dist/
 dist_build.log
 *.egg-info/
+nuitka-crash-report.xml
