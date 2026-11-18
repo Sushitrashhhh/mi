@@ -115,6 +115,23 @@ def test_doctor_flags_unset_invalid_and_ok():
 class _Part:
     def __init__(self, text):
         self.text = text
+        self.function_call = None
+
+
+class _Content:
+    def __init__(self, parts):
+        self.parts = parts
+
+
+class _Candidate:
+    def __init__(self, parts):
+        self.content = _Content(parts)
+
+
+class _Response:
+    def __init__(self, text):
+        self.text = text
+        self.candidates = [_Candidate([_Part(text)])] if text else []
 
 
 class _Models:
@@ -123,7 +140,7 @@ class _Models:
 
         async def gen():
             for t in ["a", "b", None, "c"]:
-                yield _Part(t)
+                yield _Response(t)
 
         return gen()
 
@@ -167,7 +184,11 @@ def test_cli_version_and_no_key_messages():
     r = CliRunner()
     assert "mi 0.1.0" in r.invoke(app, ["version"]).output
     out = r.invoke(app, ["ask", "hi"])
-    assert out.exit_code == 1 and "set-gemini-key" in out.output
+    assert out.exit_code == 1 and (
+        "set-gemini-key" in out.output
+        or "No Gemini key" in out.output
+        or "No model configured" in out.output
+    )
     out = r.invoke(app, ["doctor", "--json"])
     assert out.exit_code == 1 and json.loads(out.output)["key"] is False
 

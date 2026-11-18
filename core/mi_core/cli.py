@@ -12,11 +12,13 @@ from rich.console import Console
 
 from mi_core import __version__
 from mi_core import doctor as doctor_mod
+from mi_core.agent.loop import SYSTEM_PROMPT, AgentLoop, AutoApproveHandler
 from mi_core.config import MiConfig, config_path, load_config, set_model
 from mi_core.llm.base import LLMProvider, Message
 from mi_core.llm.gemini import GeminiProvider
 from mi_core.secrets import get_gemini_key, set_gemini_key
-from mi_core.server.ws import SYSTEM_PROMPT
+from mi_core.tools.builtin import register_all
+from mi_core.tools.registry import get_registry, reset_registry
 
 app = typer.Typer(help="mi: your system assistant.", no_args_is_help=False, add_completion=False)
 auth_app = typer.Typer(help="Store credentials in the OS keyring.")
@@ -32,6 +34,11 @@ def _provider() -> GeminiProvider:
     return GeminiProvider(key)
 
 
+def _setup_registry() -> None:
+    reset_registry()
+    register_all()
+
+
 async def _stream_to_console(provider: LLMProvider, cfg: MiConfig, history: list[Message]) -> str:
     full = ""
     async for chunk in provider.stream(history, model=cfg.models.default, system=SYSTEM_PROMPT):
@@ -39,6 +46,29 @@ async def _stream_to_console(provider: LLMProvider, cfg: MiConfig, history: list
             full += chunk.text
             console.out(chunk.text, end="", highlight=False)
     console.out("")
+    return full
+
+
+async def _agent_to_console(agent: AgentLoop, text: str, history: list[Message]) -> str:
+    from mi_core.events import AssistantDelta, AssistantDone, Notice, ToolFinished, ToolStarted
+
+    full = ""
+    async for event in agent.run(text, history):
+        if isinstance(event, AssistantDelta):
+            full += event.text
+            console.out(event.text, end="", highlight=False)
+        elif isinstance(event, AssistantDone):
+            if not full:
+                full = event.text
+                console.out(event.text, end="", highlight=False)
+            console.out("")
+        elif isinstance(event, ToolStarted):
+            console.print(f"[dim]⚙ {event.tool}({event.args_preview})[/dim]")
+        elif isinstance(event, ToolFinished):
+            status = "[green]✓[/green]" if event.ok else "[red]✗[/red]"
+            console.print(f"[dim]  {status} {event.tool}[/dim]")
+        elif isinstance(event, Notice):
+            console.print(f"[yellow]{event.message}[/yellow]")
     return full
 
 
@@ -57,11 +87,13 @@ def version() -> None:
 
 @app.command()
 def ask(prompt: Annotated[str, typer.Argument(help="What to ask mi.")]) -> None:
-    """One-shot question; streams the answer."""
+    """One-shot question; streams the answer, can use tools."""
     cfg = load_config()
     provider = _provider()
+    _setup_registry()
+    agent = AgentLoop(cfg, provider, get_registry(), AutoApproveHandler())
     try:
-        asyncio.run(_stream_to_console(provider, cfg, [Message(role="user", text=prompt)]))
+        asyncio.run(_agent_to_console(agent, prompt, []))
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1) from e
@@ -69,9 +101,11 @@ def ask(prompt: Annotated[str, typer.Argument(help="What to ask mi.")]) -> None:
 
 @app.command()
 def chat() -> None:
-    """Interactive chat. Ctrl+C or an empty line to quit."""
+    """Interactive chat with tools. Ctrl+C or an empty line to quit."""
     cfg = load_config()
     provider = _provider()
+    _setup_registry()
+    agent = AgentLoop(cfg, provider, get_registry(), AutoApproveHandler())
     history: list[Message] = []
     console.print("[dim]mi chat. Empty line to quit.[/dim]")
     while True:
@@ -81,14 +115,11 @@ def chat() -> None:
             break
         if not line:
             break
-        history.append(Message(role="user", text=line))
         try:
-            reply = asyncio.run(_stream_to_console(provider, cfg, history))
+            asyncio.run(_agent_to_console(agent, line, history))
         except Exception as e:
             console.print(f"[red]Error:[/red] {e}")
-            history.pop()
             continue
-        history.append(Message(role="assistant", text=reply))
 
 
 @app.command()
@@ -101,14 +132,38 @@ def serve() -> None:
 
     cfg = load_config()
     provider = _provider()
+    _setup_registry()
     token = load_or_create_token()
     console.print(f"mi listening on ws://{cfg.core.host}:{cfg.core.port}/ws (token in ~/.mi/token)")
     uvicorn.run(
-        create_app(cfg, provider, token),
+        create_app(cfg, provider, token, get_registry()),
         host=cfg.core.host,
         port=cfg.core.port,
         log_level="warning",
     )
+
+
+@app.command()
+def logs(
+    tail: Annotated[int, typer.Option(help="Number of recent entries.")] = 20,
+    as_json: Annotated[bool, typer.Option("--json", help="Machine-readable.")] = False,
+) -> None:
+    """Show the audit log (most recent entries)."""
+    from mi_core.agent.audit import read_log
+
+    entries = read_log(tail=tail)
+    if as_json:
+        console.out(json.dumps(entries, indent=2))
+        return
+    if not entries:
+        console.print("[dim]No audit log entries yet.[/dim]")
+        return
+    for entry in entries:
+        ts = entry.get("ts", "?")[:19]
+        kind = entry.get("kind", "?")
+        rest = {k: v for k, v in entry.items() if k not in ("ts", "kind")}
+        detail = " ".join(f"{k}={v}" for k, v in rest.items())
+        console.print(f"[dim]{ts}[/dim] [bold]{kind:20}[/bold] {detail[:100]}")
 
 
 @app.command()
