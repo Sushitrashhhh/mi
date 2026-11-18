@@ -4,6 +4,9 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location (Join-Path $root "core")
 
+# Use a short temp path to avoid Windows 8.3 filename collisions in Nuitka
+$buildDir = Join-Path $env:TEMP "mi_build"
+New-Item -ItemType Directory -Force $buildDir | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $root "dist") | Out-Null
 
 uv run python -m nuitka `
@@ -11,7 +14,7 @@ uv run python -m nuitka `
     --mingw64 `
     --assume-yes-for-downloads `
     --windows-console-mode=attach `
-    --output-dir="$root\dist\build" `
+    --output-dir="$buildDir" `
     --output-filename=mi.exe `
     --include-package=mi_core `
     --include-package=keyring.backends `
@@ -29,5 +32,5 @@ uv run python -m nuitka `
     mi_core/main.py
 
 if ($LASTEXITCODE -ne 0) { throw "Nuitka build failed" }
-Move-Item -Force "$root\dist\build\mi.exe" "$root\dist\mi.exe"
+Move-Item -Force "$buildDir\mi.exe" "$root\dist\mi.exe"
 Write-Host "Built: $root\dist\mi.exe"
