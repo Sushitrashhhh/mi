@@ -20,6 +20,14 @@ pub fn mi_logs_dir() -> PathBuf {
     mi_dir().join("logs")
 }
 
+pub fn mi_quarantine_dir() -> PathBuf {
+    mi_dir().join("quarantine")
+}
+
+pub fn mi_policy_path() -> PathBuf {
+    mi_dir().join("policy.toml")
+}
+
 pub fn ensure_mi_dir() -> std::io::Result<()> {
     let dir = mi_dir();
     if !dir.exists() {
