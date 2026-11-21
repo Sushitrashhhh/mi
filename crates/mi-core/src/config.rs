@@ -28,6 +28,10 @@ pub fn mi_policy_path() -> PathBuf {
     mi_dir().join("policy.toml")
 }
 
+pub fn mi_db_path() -> PathBuf {
+    mi_dir().join("mi.db")
+}
+
 pub fn ensure_mi_dir() -> std::io::Result<()> {
     let dir = mi_dir();
     if !dir.exists() {
@@ -106,12 +110,42 @@ impl Default for ModelsConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+    #[serde(default = "default_auto_save")]
+    pub auto_save: AutoSave,
+    #[serde(default = "default_embed_dim")]
+    pub embed_dim: usize,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            top_k: default_top_k(),
+            auto_save: default_auto_save(),
+            embed_dim: default_embed_dim(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoSave {
+    Off,
+    StatedOnly,
+    All,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MiConfig {
     #[serde(default)]
     pub core: CoreConfig,
     #[serde(default)]
     pub models: ModelsConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
 }
 
 impl MiConfig {
@@ -154,6 +188,15 @@ fn default_autonomy() -> Autonomy {
 }
 fn default_max_steps() -> u32 {
     12
+}
+fn default_top_k() -> usize {
+    6
+}
+fn default_auto_save() -> AutoSave {
+    AutoSave::StatedOnly
+}
+fn default_embed_dim() -> usize {
+    768
 }
 
 #[cfg(test)]

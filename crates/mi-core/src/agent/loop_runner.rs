@@ -5,6 +5,8 @@ use futures::StreamExt;
 use crate::events::ApprovalDecision;
 use crate::llm::types::{FunctionResponse, Message, Role};
 use crate::llm::AnyProvider;
+use crate::memory::extractor::MemoryExtractor;
+use crate::memory::retrieve::MemoryRetriever;
 use crate::permissions::audit::AuditLog;
 use crate::permissions::policy::{PolicyDecision, PolicyEngine, TurnTaint};
 use crate::tools::registry::{render_summary, Tier, ToolResult};
@@ -84,6 +86,8 @@ pub struct AgentLoop {
     pub policy: Arc<PolicyEngine>,
     pub audit: Arc<AuditLog>,
     pub config: AgentConfig,
+    pub memory_retriever: Option<Arc<MemoryRetriever>>,
+    pub memory_extractor: Option<Arc<MemoryExtractor>>,
 }
 
 impl AgentLoop {
@@ -97,6 +101,9 @@ impl AgentLoop {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let mut taint = TurnTaint::default();
 
+        // Build system prompt with memory context
+        let system_prompt = self.build_system_prompt(messages).await;
+
         for _step in 0..self.config.max_steps {
             self.audit
                 .log_llm_call(&self.config.session_id, &self.config.model);
@@ -104,7 +111,7 @@ impl AgentLoop {
             let mut stream = self.provider.stream(
                 messages,
                 &self.config.model,
-                Some(&self.config.system_prompt),
+                Some(&system_prompt),
                 Some(&declarations),
             );
 
@@ -135,6 +142,10 @@ impl AgentLoop {
                     turn_id: turn_id.clone(),
                     text: text.clone(),
                 });
+
+                // Post-turn memory extraction (async, best-effort)
+                self.extract_memories(messages, &text).await;
+
                 return Ok(text);
             }
 
@@ -241,6 +252,57 @@ impl AgentLoop {
 
         Err(AgentError::MaxSteps)
     }
+
+    async fn build_system_prompt(&self, messages: &[Message]) -> String {
+        let mut prompt = self.config.system_prompt.clone();
+
+        if let Some(retriever) = &self.memory_retriever {
+            // Use the latest user message as the query for memory retrieval
+            let query = messages
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::User && !m.text.is_empty())
+                .map(|m| m.text.as_str())
+                .unwrap_or("");
+
+            if !query.is_empty() {
+                match retriever.build_context_block(query).await {
+                    Ok(block) if !block.is_empty() => {
+                        prompt.push_str(&block);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("memory retrieval failed: {}", e);
+                    }
+                }
+            }
+        }
+
+        prompt
+    }
+
+    async fn extract_memories(&self, messages: &[Message], assistant_text: &str) {
+        if let Some(extractor) = &self.memory_extractor {
+            let user_text = messages
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::User && !m.text.is_empty())
+                .map(|m| m.text.as_str())
+                .unwrap_or("");
+
+            if !user_text.is_empty() {
+                match extractor.extract_from_turn(user_text, assistant_text).await {
+                    Ok(count) if count > 0 => {
+                        tracing::info!("extracted {} memories from turn", count);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("memory extraction failed: {}", e);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -283,6 +345,8 @@ mod tests {
                 max_steps: 10,
                 session_id: "test".into(),
             },
+            memory_retriever: None,
+            memory_extractor: None,
         }
     }
 

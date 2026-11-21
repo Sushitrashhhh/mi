@@ -17,6 +17,9 @@ every task.
 - After each phase, write docs/phase-N.md (built / how to run / known gaps).
 
 ## Hard rules
+- Work from first principles. Don't work on assumptions — if in doubt, ask.
+- If you don't understand something, interview me until you do.
+- Every decision and claim must be based on research from the internet, not memory.
 - Never hardcode API keys, tokens, or Gemini model IDs. Keys → keyring. Model IDs → ~/.mi/mi.toml.
 - Use the Gemini REST API directly via reqwest. Verify model IDs with
   `GET /v1beta/models` instead of guessing names from memory.

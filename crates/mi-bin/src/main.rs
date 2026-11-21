@@ -6,11 +6,15 @@ use colored::Colorize;
 use tokio::sync::RwLock;
 
 use mi_core::agent::loop_runner::{AgentConfig, AgentEvent, AgentLoop, ApprovalCallback, EventCallback};
-use mi_core::config::{MiConfig, ensure_mi_dir, mi_logs_dir, mi_quarantine_dir, mi_token_path};
+use mi_core::config::{MiConfig, ensure_mi_dir, mi_db_path, mi_logs_dir, mi_quarantine_dir, mi_token_path};
 use mi_core::events::ApprovalDecision;
 use mi_core::llm::gemini::GeminiProvider;
 use mi_core::llm::types::Message;
 use mi_core::llm::AnyProvider;
+use mi_core::memory::embed::EmbeddingClient;
+use mi_core::memory::extractor::MemoryExtractor;
+use mi_core::memory::retrieve::MemoryRetriever;
+use mi_core::memory::store::MemoryStore;
 use mi_core::permissions::audit::AuditLog;
 use mi_core::permissions::policy::{PolicyConfig, PolicyEngine};
 use mi_core::secrets;
@@ -59,6 +63,50 @@ enum Commands {
         #[arg(long, default_value = "20")]
         tail: usize,
     },
+    /// Manage mi's memory
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemoryCommands {
+    /// List stored memories
+    List {
+        /// Max number to show
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// Search memories by keyword
+    Search {
+        /// Search query
+        query: String,
+        /// Max results
+        #[arg(long, default_value = "10")]
+        limit: usize,
+    },
+    /// Forget (soft-delete) a memory by ID
+    Forget {
+        /// Memory ID
+        id: String,
+    },
+    /// Pin/unpin a memory
+    Pin {
+        /// Memory ID
+        id: String,
+        /// Unpin instead of pin
+        #[arg(long)]
+        unpin: bool,
+    },
+    /// Export all memories as JSON
+    Export {
+        /// Output file path (default: stdout)
+        #[arg(long)]
+        output: Option<String>,
+    },
+    /// Wipe all memories (irreversible!)
+    Wipe,
 }
 
 #[derive(Subcommand)]
@@ -89,6 +137,7 @@ async fn main() {
             AuthCommands::SetGeminiKey { key } => cmd_set_gemini_key(key),
         },
         Some(Commands::Logs { tail }) => cmd_logs(tail),
+        Some(Commands::Memory { command }) => cmd_memory(command),
         None => cmd_version(),
     }
 }
@@ -146,12 +195,54 @@ fn get_model_or_exit(config: &MiConfig) -> String {
     model.to_string()
 }
 
+fn open_memory_store(config: &MiConfig) -> Arc<MemoryStore> {
+    Arc::new(
+        MemoryStore::open(&mi_db_path(), config.memory.embed_dim)
+            .expect("failed to open memory database"),
+    )
+}
+
+fn create_embedding_client(api_key: &str, config: &MiConfig) -> Arc<EmbeddingClient> {
+    let embed_model = if config.models.embed.is_empty() {
+        "gemini-embedding-2".to_string()
+    } else {
+        config.models.embed.clone()
+    };
+    Arc::new(EmbeddingClient::new(
+        api_key,
+        &embed_model,
+        config.memory.embed_dim,
+    ))
+}
+
 fn create_agent_loop(api_key: &str, config: &MiConfig, model: &str) -> AgentLoop {
     let provider = Arc::new(AnyProvider::Gemini(GeminiProvider::new(
         api_key.to_string(),
     )));
     let mut registry = ToolRegistry::new();
     builtin::register_all(&mut registry);
+
+    let store = open_memory_store(config);
+    let embedder = create_embedding_client(api_key, config);
+
+    let memory_retriever = Arc::new(MemoryRetriever::new(
+        store.clone(),
+        embedder.clone(),
+        config.memory.top_k,
+    ));
+
+    let extraction_model = if config.models.fast.is_empty() {
+        model.to_string()
+    } else {
+        config.models.fast.clone()
+    };
+    let memory_extractor = Arc::new(MemoryExtractor::new(
+        provider.clone(),
+        extraction_model,
+        store,
+        embedder,
+        config.memory.auto_save.clone(),
+    ));
 
     AgentLoop {
         provider,
@@ -168,6 +259,8 @@ fn create_agent_loop(api_key: &str, config: &MiConfig, model: &str) -> AgentLoop
             max_steps: config.core.max_steps,
             session_id: uuid::Uuid::new_v4().to_string(),
         },
+        memory_retriever: Some(memory_retriever),
+        memory_extractor: Some(memory_extractor),
     }
 }
 
@@ -320,6 +413,117 @@ fn cmd_logs(tail: usize) {
     }
 }
 
+fn cmd_memory(command: MemoryCommands) {
+    let config = MiConfig::load().unwrap_or_default();
+    let store = match MemoryStore::open(&mi_db_path(), config.memory.embed_dim) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{} failed to open memory DB: {}", "error:".red().bold(), e);
+            std::process::exit(1);
+        }
+    };
+
+    match command {
+        MemoryCommands::List { limit } => {
+            let memories = store.list_memories(limit, 0).unwrap_or_default();
+            if memories.is_empty() {
+                println!("No memories stored yet.");
+                return;
+            }
+            for mem in &memories {
+                let pin = if mem.pinned { " 📌" } else { "" };
+                println!(
+                    "  {} [{}] {}{}",
+                    mem.id.chars().take(8).collect::<String>().dimmed(),
+                    mem.kind.as_str().cyan(),
+                    mem.text,
+                    pin,
+                );
+            }
+            println!(
+                "\n  {} total memories",
+                store.memory_count().unwrap_or(0).to_string().bold()
+            );
+        }
+        MemoryCommands::Search { query, limit } => {
+            let results = store.search_text(&query, limit).unwrap_or_default();
+            if results.is_empty() {
+                println!("No memories match \"{}\".", query);
+                return;
+            }
+            for (id, _score) in &results {
+                if let Ok(Some(mem)) = store.get_memory(id) {
+                    println!(
+                        "  {} [{}] {}",
+                        mem.id.chars().take(8).collect::<String>().dimmed(),
+                        mem.kind.as_str().cyan(),
+                        mem.text,
+                    );
+                }
+            }
+        }
+        MemoryCommands::Forget { id } => {
+            // Support both short (8-char prefix) and full IDs
+            let full_id = resolve_memory_id(&store, &id);
+            match store.forget(&full_id) {
+                Ok(true) => println!("{} Forgotten.", "ok:".green().bold()),
+                Ok(false) => println!("{} No memory with that ID.", "error:".red().bold()),
+                Err(e) => eprintln!("{} {}", "error:".red().bold(), e),
+            }
+        }
+        MemoryCommands::Pin { id, unpin } => {
+            let full_id = resolve_memory_id(&store, &id);
+            let pinned = !unpin;
+            match store.pin(&full_id, pinned) {
+                Ok(true) => {
+                    let verb = if pinned { "Pinned" } else { "Unpinned" };
+                    println!("{} {}.", "ok:".green().bold(), verb);
+                }
+                Ok(false) => println!("{} No memory with that ID.", "error:".red().bold()),
+                Err(e) => eprintln!("{} {}", "error:".red().bold(), e),
+            }
+        }
+        MemoryCommands::Export { output } => {
+            let memories = store.export_all().unwrap_or_default();
+            let json = serde_json::to_string_pretty(&memories).unwrap();
+            if let Some(path) = output {
+                std::fs::write(&path, &json).unwrap();
+                println!("{} Exported {} memories to {}", "ok:".green().bold(), memories.len(), path);
+            } else {
+                println!("{}", json);
+            }
+        }
+        MemoryCommands::Wipe => {
+            print!("{} This will delete ALL memories. Type 'yes' to confirm: ", "warning:".yellow().bold());
+            std::io::stdout().flush().unwrap();
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input).ok();
+            if input.trim() == "yes" {
+                store.wipe().unwrap();
+                println!("{} All memories wiped.", "ok:".green().bold());
+            } else {
+                println!("Cancelled.");
+            }
+        }
+    }
+}
+
+fn resolve_memory_id(store: &MemoryStore, short_id: &str) -> String {
+    // If it looks like a full UUID, use as-is
+    if short_id.len() > 16 {
+        return short_id.to_string();
+    }
+    // Otherwise search the memory list for a prefix match
+    if let Ok(memories) = store.list_memories(1000, 0) {
+        for mem in &memories {
+            if mem.id.starts_with(short_id) {
+                return mem.id.clone();
+            }
+        }
+    }
+    short_id.to_string()
+}
+
 async fn cmd_doctor(fix: bool) {
     println!("{}", "mi doctor".cyan().bold());
     println!();
@@ -443,6 +647,18 @@ async fn cmd_doctor(fix: bool) {
     let decls = registry.gemini_declarations();
     println!();
     println!("  {} {} tools registered", "✓".green(), decls.len());
+
+    // Phase 2: show memory stats
+    let config_for_mem = MiConfig::load().unwrap_or_default();
+    match MemoryStore::open(&mi_db_path(), config_for_mem.memory.embed_dim) {
+        Ok(store) => {
+            let count = store.memory_count().unwrap_or(0);
+            println!("  {} Memory DB open, {} memories stored", "✓".green(), count);
+        }
+        Err(e) => {
+            println!("  {} Memory DB error: {}", "✗".red(), e);
+        }
+    }
 }
 
 async fn cmd_serve() {

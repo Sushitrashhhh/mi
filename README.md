@@ -24,7 +24,7 @@
 
 Think of it as Google Assistant or Siri, but for your desktop, running locally, and you own every byte of your data.
 
-**Current status:** Phase 1 complete — text brain with agent loop, 20 built-in tools, permission engine, and prompt injection defenses. 33 tests pass, 9.3 MB binary.
+**Current status:** Phase 2 complete — persistent memory with hybrid retrieval, post-turn extraction, and secret filtering on top of the agent loop, 20 built-in tools, and permission engine. 59 tests pass, clippy clean.
 
 ### Key features
 
@@ -36,6 +36,7 @@ Think of it as Google Assistant or Siri, but for your desktop, running locally, 
 | **Prompt injection defense** | Text from files, web pages, and screen captures is treated as untrusted data. Instructions found inside it are never executed without your approval. Tested. |
 | **Quarantine, not delete** | mi never permanently deletes a file. "Delete" moves it to `~/.mi/quarantine/`, restorable for 14 days. |
 | **Audit everything** | Every model call, tool execution, and approval decision is logged to `~/.mi/logs/audit.jsonl`. |
+| **Persistent memory** | mi remembers you across sessions — preferences, facts, people. Hybrid retrieval (vector + FTS) surfaces relevant memories automatically. Secrets are filtered before storage. `mi memory` to manage. |
 | **Config, not code** | Gemini model IDs live in `~/.mi/mi.toml`, never hardcoded. `mi doctor --fix` auto-picks the best available model. |
 
 ---
@@ -107,8 +108,8 @@ cargo clippy -- -D warnings
                     │  │ Ollama   │   │ Audit log  │   │ Scheduler  │  │
                     │  └──────────┘   └────────────┘   └────────────┘  │
                     │  ┌──────────────────────────────────────────────┐│
-                    │  │ Memory: SQLite + sqlite-vec (facts, episodes,││
-                    │  │ prefs, working context)              Phase 2  ││
+                    │  │ Memory: SQLite + FTS5 + embeddings (facts,   ││
+                    │  │ prefs, episodes, working context)      ✅     ││
                     │  └──────────────────────────────────────────────┘│
                     │        WebSocket event bus  ws://127.0.0.1:7777   │
                     └───────────────┬──────────────────────┬───────────┘
@@ -145,16 +146,22 @@ mi/
 │   │       │   ├── registry.rs   # ToolDef, Tier, ToolRegistry
 │   │       │   ├── builtin/      # 20 built-in tools (6 packs)
 │   │       │   └── os_adapt/     # OsAdapter trait + Windows impl
+│   │       ├── memory/
+│   │       │   ├── store.rs      # SQLite schema, CRUD, FTS5, cosine similarity
+│   │       │   ├── embed.rs      # Gemini embedding API client
+│   │       │   ├── retrieve.rs   # Hybrid retrieval (vector + FTS + RRF)
+│   │       │   └── extractor.rs  # Post-turn extraction + secret filtering
 │   │       ├── permissions/
 │   │       │   ├── policy.rs     # Risk tiers, taint tracking
 │   │       │   └── audit.rs      # JSONL audit log
 │   │       └── server/
 │   │           └── ws.rs         # axum WebSocket server
 │   └── mi-bin/               # Binary: CLI entry point
-│       └── src/main.rs           # clap CLI: ask, chat, doctor, serve, logs
+│       └── src/main.rs           # clap CLI: ask, chat, doctor, serve, logs, memory
 └── docs/
     ├── phase-0.md
-    └── phase-1.md
+    ├── phase-1.md
+    └── phase-2.md
 ```
 
 ---
@@ -166,10 +173,16 @@ mi/
 ```
 mi ask "..."              One-shot question, streams the answer with tool use
 mi chat                   Interactive REPL with multi-turn memory and tools
-mi doctor [--fix]         Check API key, model availability, registered tools
+mi doctor [--fix]         Check API key, model availability, tools, memory DB
 mi serve                  Start the WebSocket server (ws://127.0.0.1:7777)
 mi auth set-gemini-key    Store your Gemini key in the OS keyring
 mi logs [--tail N]        View the audit log (default: last 20 entries)
+mi memory list [--limit]  List stored memories
+mi memory search <query>  Search memories by keyword
+mi memory forget <id>     Soft-delete a memory (supports 8-char prefix IDs)
+mi memory pin <id>        Pin a memory (always included in context)
+mi memory export          Export all memories as JSON
+mi memory wipe            Delete all memories (requires confirmation)
 mi version                Print version
 ```
 
@@ -193,6 +206,19 @@ mi chat
 # mi: (uses files.list, shows results)
 # you: delete the ones older than 30 days
 # mi: (asks for approval for each deletion)
+
+# Memory — mi remembers across sessions
+mi chat
+# you: I edit in Premiere and like short answers
+# mi: Got it. (memories auto-extracted in background)
+
+mi memory list
+#   e3f1a2b4 [preference] User likes short answers
+#   7c8d9e0f [fact] User edits video in Premiere Pro
+
+mi memory search "Premiere"
+mi memory forget e3f1a2b4
+mi memory export --output ~/my-memories.json
 ```
 
 ---
@@ -261,8 +287,13 @@ deep = ""
 vision = ""
 live = ""
 tts = ""
-embed = ""
+embed = ""                     # Gemini embedding model (default: gemini-embedding-2)
 local = "llama3.2:3b"
+
+[memory]
+top_k = 6                     # Max relevant memories injected per turn
+auto_save = "stated_only"      # "off" | "stated_only" | "all"
+embed_dim = 768                # Embedding dimensions (match your embed model)
 ```
 
 Permission overrides live at `~/.mi/policy.toml`:
@@ -306,6 +337,8 @@ Tools that read external content (`files.read`, `web.search`, `web.fetch`) set t
 | CLI | `clap` 4.6 | Argument parsing with derive macros |
 | Secrets | `keyring` 4.2 | Windows Credential Manager |
 | IDs | `uuid` + `chrono` | Event IDs and timestamps |
+| SQLite | `rusqlite` 0.43 (bundled) | Memory DB with FTS5 and custom functions |
+| Regex | `regex` 1.11 | Secret filtering in memory extraction |
 | Errors | `thiserror` + `anyhow` | Typed and ad-hoc error handling |
 | Terminal | `colored` 3 | Colored CLI output |
 
@@ -321,8 +354,8 @@ mi is built in phases. Each phase has clear acceptance criteria and tests that m
 |---|---|---|
 | **0** | Skeleton and text brain — config, keyring, Gemini streaming, `mi ask`, `mi doctor` | ✅ Done |
 | **1** | Agent loop, tools, permissions — 20 tools, policy engine, taint tracking, audit log, injection tests | ✅ Done |
-| **2** | Memory — SQLite + sqlite-vec, embeddings, hybrid retrieval, `mi memory` commands | 🔲 Next |
-| **3** | System presence and overlay — egui overlay bar, tray icon, global hotkeys, approval cards | 🔲 |
+| **2** | Memory — SQLite + FTS5 + embeddings, hybrid retrieval, extraction, secret filtering, `mi memory` CLI | ✅ Done |
+| **3** | System presence and overlay — egui overlay bar, tray icon, global hotkeys, approval cards | 🔲 Next |
 | **4** | Voice — push-to-talk, wake word ("hey mi"), VAD, Whisper, TTS | 🔲 |
 | **5** | Vision — screenshot tool, screen-ask, image analysis | 🔲 |
 | **6** | Integrations and scheduling — persistent reminders, Google Calendar/Gmail, Telegram | 🔲 |
@@ -340,7 +373,7 @@ cargo build
 # Build (release, produces mi.exe at ~9.3 MB)
 cargo build --release
 
-# Run tests (33 pass)
+# Run tests (59 pass)
 cargo test
 
 # Lint
@@ -356,6 +389,7 @@ cargo run -p mi-bin -- chat
 
 - **Unit tests**: policy engine tier matrix, tool schema generation, summary rendering
 - **Agent tests with FakeProvider**: the `FakeProvider` replays scripted function calls so agent-loop tests are deterministic and free — no Gemini API calls needed
+- **Memory tests**: SQLite CRUD, FTS search, vector cosine similarity, embedding storage, secret filtering (API keys, tokens, credit cards, SSNs, passwords)
 - **Prompt injection suite**: poisoned web pages and files that try to trigger destructive tools — all must result in an approval request or refusal
 
 ```bash
@@ -364,6 +398,10 @@ cargo test -p mi-core agent::loop_runner::tests
 
 # Run just the policy tests
 cargo test -p mi-core permissions::policy::tests
+
+# Run just the memory tests
+cargo test -p mi-core memory::store::tests
+cargo test -p mi-core memory::extractor::tests
 ```
 
 ---

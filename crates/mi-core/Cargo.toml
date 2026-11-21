@@ -39,6 +39,12 @@ anyhow = "1"
 # Home directory
 dirs = "6"
 
+# SQLite for memory persistence (bundled = ships SQLite, functions = custom SQL functions)
+rusqlite = { version = "0.43", features = ["bundled", "functions"] }
+
+# Secret filtering in memory extraction
+regex = "1.11"
+
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"
