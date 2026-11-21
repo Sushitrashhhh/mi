@@ -389,5 +389,5 @@ This project is currently unlicensed. All rights reserved.
 ---
 
 <p align="center">
-  Built with Rust 🦀 and Gemini ✦
+  Built with Rust 🦀 and Claude ✳
 </p>
