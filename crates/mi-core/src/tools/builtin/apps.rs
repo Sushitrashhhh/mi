@@ -13,7 +13,7 @@ pub fn register(registry: &mut ToolRegistry) {
 
     registry.register(ToolDef {
         name: "apps.open".into(),
-        description: "Open an application or URL. For URLs, opens in the default browser.".into(),
+        description: "Open an application by name (e.g. 'whatsapp', 'chrome', 'spotify', 'notepad') or a URL. Handles Windows Store apps, Start Menu shortcuts, and executables in PATH. Just pass the common app name — no need to find the full path.".into(),
         tier: Tier::Safe,
         parameters: serde_json::json!({
             "type": "object",

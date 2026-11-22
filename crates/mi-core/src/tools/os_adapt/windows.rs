@@ -49,12 +49,73 @@ impl OsAdapter for WindowsAdapter {
         let app = app.to_string();
         let args: Vec<String> = args.to_vec();
         Box::pin(async move {
-            let mut cmd = tokio::process::Command::new(&app);
-            for arg in &args {
-                cmd.arg(arg);
+            let app_lower = app.to_lowercase();
+
+            // Check for well-known protocol URIs first (opens UWP/Store apps)
+            let protocol = match app_lower.as_str() {
+                "whatsapp" => Some("whatsapp://"),
+                "spotify" => Some("spotify://"),
+                "discord" => Some("discord://"),
+                "telegram" => Some("tg://"),
+                "slack" => Some("slack://"),
+                "teams" | "microsoft teams" => Some("msteams://"),
+                "settings" | "windows settings" => Some("ms-settings://"),
+                "store" | "microsoft store" => Some("ms-windows-store://"),
+                "calculator" | "calc" => Some("calculator://"),
+                "mail" | "outlook" => Some("outlookmail://"),
+                "calendar" => Some("outlookcal://"),
+                "maps" => Some("bingmaps://"),
+                "photos" => Some("ms-photos://"),
+                "camera" => Some("microsoft.windows.camera://"),
+                "clock" | "alarms" => Some("ms-clock://"),
+                _ => None,
+            };
+
+            if let Some(uri) = protocol {
+                let output = tokio::process::Command::new("cmd")
+                    .args(["/C", "start", "", uri])
+                    .output()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if output.status.success() {
+                    return Ok(format!("Opened: {}", app));
+                }
             }
-            cmd.spawn().map_err(|e| e.to_string())?;
-            Ok(format!("Opened: {}", app))
+
+            // Try direct spawn (works for executables in PATH like notepad, code, etc.)
+            {
+                let mut cmd = tokio::process::Command::new(&app);
+                for arg in &args {
+                    cmd.arg(arg);
+                }
+                if cmd.spawn().is_ok() {
+                    return Ok(format!("Opened: {}", app));
+                }
+            }
+
+            // Try `start` command (resolves Start Menu shortcuts, registered apps)
+            {
+                let mut cmd_args = vec!["/C".to_string(), "start".to_string(), String::new(), app.clone()];
+                cmd_args.extend(args.iter().cloned());
+                let output = tokio::process::Command::new("cmd")
+                    .args(&cmd_args)
+                    .output()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if output.status.success() {
+                    return Ok(format!("Opened: {}", app));
+                }
+            }
+
+            // Last resort: search Start Menu for a matching .lnk shortcut
+            let script = format!(
+                r#"$q = '*{}*'; $paths = @("$env:APPDATA\Microsoft\Windows\Start Menu", "$env:ProgramData\Microsoft\Windows\Start Menu"); $found = $paths | ForEach-Object {{ Get-ChildItem -Path $_ -Filter "$q.lnk" -Recurse -ErrorAction SilentlyContinue }} | Select-Object -First 1; if ($found) {{ Start-Process $found.FullName; $found.Name }} else {{ Write-Error 'App not found' }}"#,
+                app.replace('\'', "''")
+            );
+            match WindowsAdapter::powershell(&script).await {
+                Ok(name) => Ok(format!("Opened: {}", name.trim_end_matches(".lnk"))),
+                Err(_) => Err(format!("Could not find or open '{}'", app)),
+            }
         })
     }
 
