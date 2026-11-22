@@ -24,15 +24,17 @@
 
 Think of it as Google Assistant or Siri, but for your desktop, running locally, and you own every byte of your data.
 
-**Current status:** Phase 2 complete — persistent memory with hybrid retrieval, post-turn extraction, and secret filtering on top of the agent loop, 20 built-in tools, and permission engine. 59 tests pass, clippy clean.
+**Current status:** Phase 3 complete — native overlay bar with system tray, global hotkeys, approval cards, and native notifications on top of the agent loop, 20 built-in tools, persistent memory, and permission engine. 59 tests pass, clippy clean.
 
 ### Key features
 
 | Feature | Description |
 |---|---|
 | **One binary** | A single `mi.exe` is both the background service and the CLI. No runtime, no admin, nothing else to install. |
+| **Native overlay** | A borderless egui bar appears on hotkey (Ctrl+Shift+M), streams responses, shows tool status chips, and fades away when done. |
+| **System tray** | mi lives in your system tray with a context menu. Starts at login via Windows Task Scheduler. |
 | **Agent loop with tools** | mi can plan multi-step actions: open apps, manage files, run shell commands, set timers, search the web — all through natural language. |
-| **Approval before anything risky** | Every tool has a risk tier. Reading files is automatic; deleting them asks you first. Always. |
+| **Approval before anything risky** | Every tool has a risk tier. Reading files is automatic; deleting them asks you first. Always. Approval cards appear in the overlay with Approve / Deny / Always buttons. |
 | **Prompt injection defense** | Text from files, web pages, and screen captures is treated as untrusted data. Instructions found inside it are never executed without your approval. Tested. |
 | **Quarantine, not delete** | mi never permanently deletes a file. "Delete" moves it to `~/.mi/quarantine/`, restorable for 14 days. |
 | **Audit everything** | Every model call, tool execution, and approval decision is logged to `~/.mi/logs/audit.jsonl`. |
@@ -56,7 +58,7 @@ Think of it as Google Assistant or Siri, but for your desktop, running locally, 
 git clone https://github.com/Sushitrashhhh/mi.git
 cd mi
 
-# Build (produces target/release/mi.exe — 9.3 MB)
+# Build (produces target/release/mi.exe)
 cargo build --release
 
 # Store your Gemini API key in the OS keyring (Windows Credential Manager)
@@ -70,6 +72,17 @@ mi ask "what time is it?"
 
 # Interactive chat with tool use
 mi chat
+
+# Start the full assistant (tray + overlay + hotkeys)
+mi
+# or explicitly:
+mi start
+
+# Register to start at login
+mi install-service
+
+# Remove from login
+mi uninstall-service
 ```
 
 ### Verify the installation
@@ -156,26 +169,40 @@ mi/
 │   │       │   └── audit.rs      # JSONL audit log
 │   │       └── server/
 │   │           └── ws.rs         # axum WebSocket server
-│   └── mi-bin/               # Binary: CLI entry point
-│       └── src/main.rs           # clap CLI: ask, chat, doctor, serve, logs, memory
+│   └── mi-bin/               # Binary: CLI + overlay entry point
+│       └── src/
+│           ├── main.rs              # clap CLI: ask, chat, doctor, start, install-service
+│           ├── instance_lock.rs     # Single-instance lock (TCP + PID file)
+│           ├── service.rs           # Windows autostart (Task Scheduler)
+│           └── overlay/
+│               ├── app.rs           # Egui overlay bar (phases, rendering, events)
+│               ├── hotkeys.rs       # Global hotkey registration (Ctrl+Shift+M, etc.)
+│               ├── tray.rs          # System tray icon + context menu
+│               ├── state.rs         # Channel types (UiCommand, BackendEvent)
+│               └── notify.rs        # Native OS notifications
 └── docs/
     ├── phase-0.md
     ├── phase-1.md
-    └── phase-2.md
+    ├── phase-2.md
+    └── phase-3.md
 ```
 
 ---
 
 ## CLI reference
 
-`mi` with no args shows the version. All commands:
+`mi` with no args launches the full assistant (tray + overlay). All commands:
 
 ```
+mi                        Start the assistant (tray icon + overlay + hotkeys)
+mi start                  Same as above (explicit)
 mi ask "..."              One-shot question, streams the answer with tool use
 mi chat                   Interactive REPL with multi-turn memory and tools
 mi doctor [--fix]         Check API key, model availability, tools, memory DB
 mi serve                  Start the WebSocket server (ws://127.0.0.1:7777)
 mi auth set-gemini-key    Store your Gemini key in the OS keyring
+mi install-service        Register mi to start at Windows login
+mi uninstall-service      Remove mi from Windows login
 mi logs [--tail N]        View the audit log (default: last 20 entries)
 mi memory list [--limit]  List stored memories
 mi memory search <query>  Search memories by keyword
@@ -185,6 +212,15 @@ mi memory export          Export all memories as JSON
 mi memory wipe            Delete all memories (requires confirmation)
 mi version                Print version
 ```
+
+### Hotkeys
+
+| Shortcut | Action |
+|---|---|
+| **Ctrl+Shift+M** | Toggle the overlay (open/close) |
+| **Ctrl+Alt+Esc** | Kill switch — cancel the current agent turn |
+| **Enter** | Send message (when overlay is open) |
+| **Escape** | Dismiss the overlay |
 
 ### Examples
 
@@ -341,6 +377,11 @@ Tools that read external content (`files.read`, `web.search`, `web.fetch`) set t
 | Regex | `regex` 1.11 | Secret filtering in memory extraction |
 | Errors | `thiserror` + `anyhow` | Typed and ad-hoc error handling |
 | Terminal | `colored` 3 | Colored CLI output |
+| Overlay | `eframe` 0.37 | Native egui overlay bar |
+| System tray | `tray-icon` 0.26 + `muda` 0.21 | Tray icon and context menu |
+| Hotkeys | `global-hotkey` 0.10 | System-wide keyboard shortcuts |
+| Notifications | `notify-rust` 4 | Native OS toast notifications |
+| Cancellation | `tokio-util` 0.7 | CancellationToken for kill switch |
 
 No SDK — mi talks to the **Gemini REST API directly** via `reqwest`, including SSE streaming for `streamGenerateContent`.
 
@@ -355,8 +396,8 @@ mi is built in phases. Each phase has clear acceptance criteria and tests that m
 | **0** | Skeleton and text brain — config, keyring, Gemini streaming, `mi ask`, `mi doctor` | ✅ Done |
 | **1** | Agent loop, tools, permissions — 20 tools, policy engine, taint tracking, audit log, injection tests | ✅ Done |
 | **2** | Memory — SQLite + FTS5 + embeddings, hybrid retrieval, extraction, secret filtering, `mi memory` CLI | ✅ Done |
-| **3** | System presence and overlay — egui overlay bar, tray icon, global hotkeys, approval cards | 🔲 Next |
-| **4** | Voice — push-to-talk, wake word ("hey mi"), VAD, Whisper, TTS | 🔲 |
+| **3** | System presence and overlay — egui overlay bar, tray icon, global hotkeys, approval cards, notifications, autostart | ✅ Done |
+| **4** | Voice — push-to-talk, wake word ("hey mi"), VAD, local STT/TTS | 🔲 Next |
 | **5** | Vision — screenshot tool, screen-ask, image analysis | 🔲 |
 | **6** | Integrations and scheduling — persistent reminders, Google Calendar/Gmail, Telegram | 🔲 |
 | **7** | Offline mode — Ollama provider, local-first fallback | 🔲 |
@@ -370,7 +411,7 @@ mi is built in phases. Each phase has clear acceptance criteria and tests that m
 # Build (debug)
 cargo build
 
-# Build (release, produces mi.exe at ~9.3 MB)
+# Build (release)
 cargo build --release
 
 # Run tests (59 pass)
@@ -383,6 +424,9 @@ cargo clippy -- -D warnings
 cargo run -p mi-bin -- ask "hello"
 cargo run -p mi-bin -- doctor --fix
 cargo run -p mi-bin -- chat
+
+# Start the full assistant (tray + overlay)
+cargo run -p mi-bin
 ```
 
 ### Testing philosophy
