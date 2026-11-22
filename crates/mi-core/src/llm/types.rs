@@ -7,6 +7,8 @@ pub struct FunctionCall {
     pub args: serde_json::Value,
     #[serde(default)]
     pub call_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +55,17 @@ pub struct ModelInfo {
     pub input_token_limit: Option<u64>,
     #[serde(default)]
     pub output_token_limit: Option<u64>,
+}
+
+impl FunctionCall {
+    pub fn new(name: &str, args: serde_json::Value, call_id: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            args,
+            call_id: call_id.to_string(),
+            thought_signature: None,
+        }
+    }
 }
 
 impl Message {

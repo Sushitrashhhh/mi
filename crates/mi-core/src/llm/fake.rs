@@ -133,11 +133,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fake_provider_function_calls() {
-        let fc = FunctionCall {
-            name: "system.time".into(),
-            args: serde_json::json!({}),
-            call_id: "c1".into(),
-        };
+        let fc = FunctionCall::new("system.time", serde_json::json!({}), "c1");
         let provider = FakeProvider::new(vec![ScriptedReply::with_calls(vec![fc])]);
         let msgs = vec![Message::user("what time")];
         let mut stream = provider.stream(&msgs, "test", None, None);

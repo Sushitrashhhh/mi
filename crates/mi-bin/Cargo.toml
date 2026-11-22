@@ -36,3 +36,23 @@ tracing = "0.1"
 
 # JSON serialization (for memory export)
 serde_json = "1.0"
+
+# Phase 3: System presence & overlay
+eframe = "0.37"            # egui overlay bar
+tray-icon = "0.26"         # system tray icon
+muda = "0.21"              # tray context menu
+global-hotkey = "0.10"     # global hotkeys (Ctrl+Shift+M, etc.)
+notify-rust = "4"          # native OS notifications
+image = "0.25"             # icon image creation for tray
+
+# Timestamps (for overlay display)
+chrono = "0.4"
+
+# Serde (for overlay state serialization)
+serde = { version = "1.0", features = ["derive"] }
+
+# CancellationToken
+tokio-util = "0.7"
+
+# Home directory (for instance lock PID file)
+dirs = "6"

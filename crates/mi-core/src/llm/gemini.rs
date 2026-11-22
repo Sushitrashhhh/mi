@@ -53,6 +53,10 @@ struct Part {
     function_call: Option<GeminiFunctionCall>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "functionResponse")]
     function_response: Option<GeminiFunctionResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "thought")]
+    thought: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "thoughtSignature")]
+    thought_signature: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -139,6 +143,8 @@ impl GeminiProvider {
                             name: fr.name.clone(),
                             response: serde_json::json!({"result": fr.result}),
                         }),
+                        thought: None,
+                        thought_signature: None,
                     })
                     .collect();
                 Content {
@@ -153,6 +159,8 @@ impl GeminiProvider {
                         text: Some(msg.text.clone()),
                         function_call: None,
                         function_response: None,
+                        thought: None,
+                        thought_signature: None,
                     });
                 }
                 for fc in &msg.function_calls {
@@ -163,6 +171,8 @@ impl GeminiProvider {
                             args: fc.args.clone(),
                         }),
                         function_response: None,
+                        thought: None,
+                        thought_signature: fc.thought_signature.clone(),
                     });
                 }
                 Content {
@@ -176,6 +186,8 @@ impl GeminiProvider {
                     text: Some(msg.text.clone()),
                     function_call: None,
                     function_response: None,
+                    thought: None,
+                    thought_signature: None,
                 }],
             },
             Role::User => Content {
@@ -184,6 +196,8 @@ impl GeminiProvider {
                     text: Some(msg.text.clone()),
                     function_call: None,
                     function_response: None,
+                    thought: None,
+                    thought_signature: None,
                 }],
             },
         }
@@ -217,6 +231,8 @@ impl GeminiProvider {
                 text: Some(s.to_string()),
                 function_call: None,
                 function_response: None,
+                thought: None,
+                thought_signature: None,
             }],
         });
 
@@ -291,6 +307,7 @@ impl GeminiProvider {
                                                 name: fc.name.clone(),
                                                 args: fc.args.clone(),
                                                 call_id: fc.name.clone(),
+                                                thought_signature: part.thought_signature.clone(),
                                             });
                                         }
                                     }
@@ -397,11 +414,7 @@ mod tests {
         let msg = Message {
             role: Role::Assistant,
             text: String::new(),
-            function_calls: vec![FunctionCall {
-                name: "system.time".into(),
-                args: serde_json::json!({}),
-                call_id: "c1".into(),
-            }],
+            function_calls: vec![FunctionCall::new("system.time", serde_json::json!({}), "c1")],
             function_responses: vec![],
         };
         let content = GeminiProvider::message_to_content(&msg);

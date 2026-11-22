@@ -45,6 +45,9 @@ rusqlite = { version = "0.43", features = ["bundled", "functions"] }
 # Secret filtering in memory extraction
 regex = "1.11"
 
+# CancellationToken for kill switch / turn cancellation
+tokio-util = "0.7"
+
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"

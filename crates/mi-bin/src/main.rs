@@ -1,11 +1,16 @@
+mod instance_lock;
+mod overlay;
+mod service;
+
 use std::io::Write;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
-use mi_core::agent::loop_runner::{AgentConfig, AgentEvent, AgentLoop, ApprovalCallback, EventCallback};
+use mi_core::agent::loop_runner::{AgentConfig, AgentError, AgentEvent, AgentLoop, ApprovalCallback, EventCallback};
 use mi_core::config::{MiConfig, ensure_mi_dir, mi_db_path, mi_logs_dir, mi_quarantine_dir, mi_token_path};
 use mi_core::events::ApprovalDecision;
 use mi_core::llm::gemini::GeminiProvider;
@@ -24,6 +29,8 @@ use mi_core::tools::os_adapt;
 use mi_core::tools::registry::ToolRegistry;
 use mi_core::tools::ToolExecutor;
 
+use overlay::state::{BackendEvent, UiCommand};
+
 const SYSTEM_PROMPT: &str = include_str!("../../../prompts/system.md");
 
 #[derive(Parser)]
@@ -35,6 +42,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Start the assistant (tray icon + overlay)
+    Start,
     /// One-shot question, streams the answer
     Ask {
         /// The question to ask mi
@@ -68,40 +77,35 @@ enum Commands {
         #[command(subcommand)]
         command: MemoryCommands,
     },
+    /// Register mi to start at login
+    InstallService,
+    /// Remove mi from login autostart
+    UninstallService,
 }
 
 #[derive(Subcommand)]
 enum MemoryCommands {
     /// List stored memories
     List {
-        /// Max number to show
         #[arg(long, default_value = "20")]
         limit: usize,
     },
     /// Search memories by keyword
     Search {
-        /// Search query
         query: String,
-        /// Max results
         #[arg(long, default_value = "10")]
         limit: usize,
     },
     /// Forget (soft-delete) a memory by ID
-    Forget {
-        /// Memory ID
-        id: String,
-    },
+    Forget { id: String },
     /// Pin/unpin a memory
     Pin {
-        /// Memory ID
         id: String,
-        /// Unpin instead of pin
         #[arg(long)]
         unpin: bool,
     },
     /// Export all memories as JSON
     Export {
-        /// Output file path (default: stdout)
         #[arg(long)]
         output: Option<String>,
     },
@@ -113,13 +117,11 @@ enum MemoryCommands {
 enum AuthCommands {
     /// Store your Gemini API key in the OS keyring
     SetGeminiKey {
-        /// The API key (if omitted, you'll be prompted)
         key: Option<String>,
     },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli = Cli::parse();
 
     if let Err(e) = ensure_mi_dir() {
@@ -128,19 +130,247 @@ async fn main() {
     }
 
     match cli.command {
-        Some(Commands::Ask { question }) => cmd_ask(&question).await,
-        Some(Commands::Chat) => cmd_chat().await,
-        Some(Commands::Doctor { fix }) => cmd_doctor(fix).await,
-        Some(Commands::Serve) => cmd_serve().await,
+        None | Some(Commands::Start) => cmd_start(),
+        Some(Commands::InstallService) => cmd_install_service(),
+        Some(Commands::UninstallService) => cmd_uninstall_service(),
         Some(Commands::Version) => cmd_version(),
         Some(Commands::Auth { command }) => match command {
             AuthCommands::SetGeminiKey { key } => cmd_set_gemini_key(key),
         },
         Some(Commands::Logs { tail }) => cmd_logs(tail),
         Some(Commands::Memory { command }) => cmd_memory(command),
-        None => cmd_version(),
+        Some(async_cmd) => {
+            let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+            rt.block_on(async {
+                match async_cmd {
+                    Commands::Ask { question } => cmd_ask(&question).await,
+                    Commands::Chat => cmd_chat().await,
+                    Commands::Doctor { fix } => cmd_doctor(fix).await,
+                    Commands::Serve => cmd_serve().await,
+                    _ => unreachable!(),
+                }
+            });
+        }
     }
 }
+
+// ─── Phase 3: Start (tray + overlay + backend) ───
+
+fn cmd_start() {
+    let _lock = match instance_lock::InstanceLock::acquire() {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("{} {}", "error:".red().bold(), e);
+            std::process::exit(1);
+        }
+    };
+
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<UiCommand>();
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<BackendEvent>();
+    let (ctx_tx, ctx_rx) = std::sync::mpsc::sync_channel::<eframe::egui::Context>(1);
+
+    // Spawn backend thread with its own tokio runtime
+    let event_tx_backend = event_tx.clone();
+    std::thread::spawn(move || {
+        let egui_ctx = ctx_rx.recv().expect("failed to receive egui context");
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        rt.block_on(backend_loop(cmd_rx, event_tx_backend, egui_ctx));
+    });
+
+    // Create tray icon on main thread (must be before eframe for winit compatibility)
+    let _tray = overlay::tray::create_tray();
+
+    // Register global hotkeys on main thread
+    let (_hotkey_manager, hotkey_ids) = match overlay::hotkeys::register_hotkeys() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("{} failed to register hotkeys: {}", "error:".red().bold(), e);
+            std::process::exit(1);
+        }
+    };
+
+    // Run overlay (blocks main thread)
+    overlay::app::run_overlay(cmd_tx, event_rx, hotkey_ids, ctx_tx);
+}
+
+async fn backend_loop(
+    cmd_rx: std::sync::mpsc::Receiver<UiCommand>,
+    event_tx: std::sync::mpsc::Sender<BackendEvent>,
+    egui_ctx: eframe::egui::Context,
+) {
+    let api_key = match secrets::get_gemini_key() {
+        Ok(Some(key)) if !key.is_empty() => key,
+        _ => {
+            let msg = "No Gemini API key. Run: mi auth set-gemini-key";
+            overlay::notify::show_error(msg);
+            let _ = event_tx.send(BackendEvent::Error {
+                message: msg.into(),
+            });
+            egui_ctx.request_repaint();
+            return;
+        }
+    };
+
+    let config = MiConfig::load().unwrap_or_default();
+    let model = config.active_model().to_string();
+    if model.is_empty() {
+        let _ = event_tx.send(BackendEvent::Error {
+            message: "No model configured. Run: mi doctor --fix".into(),
+        });
+        egui_ctx.request_repaint();
+        return;
+    }
+
+    let approval_slot: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<ApprovalDecision>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let cancel_slot: Arc<std::sync::Mutex<Option<CancellationToken>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<String>(8);
+
+    // Command processor: blocking thread dispatches commands
+    let approval_cmd = approval_slot.clone();
+    let cancel_cmd = cancel_slot.clone();
+    let event_tx_cmd = event_tx.clone();
+    let egui_ctx_cmd = egui_ctx.clone();
+    tokio::task::spawn_blocking(move || {
+        while let Ok(cmd) = cmd_rx.recv() {
+            match cmd {
+                UiCommand::SendMessage(text) => {
+                    let _ = msg_tx.blocking_send(text);
+                }
+                UiCommand::ApprovalResponse { decision, .. } => {
+                    if let Some(tx) = approval_cmd.lock().unwrap().take() {
+                        let _ = tx.send(decision);
+                    }
+                }
+                UiCommand::CancelTurn => {
+                    if let Some(token) = cancel_cmd.lock().unwrap().as_ref() {
+                        token.cancel();
+                    }
+                    let _ = event_tx_cmd.send(BackendEvent::Cancelled);
+                    egui_ctx_cmd.request_repaint();
+                }
+                UiCommand::Quit => break,
+            }
+        }
+    });
+
+    // Message handler: runs agent loop per message
+    while let Some(text) = msg_rx.recv().await {
+        let cancel_token = CancellationToken::new();
+        *cancel_slot.lock().unwrap() = Some(cancel_token.clone());
+
+        let mut agent = create_agent_loop(&api_key, &config, &model);
+        agent.cancel_token = Some(cancel_token);
+
+        let on_event = make_gui_event_callback(event_tx.clone(), egui_ctx.clone());
+        let approve = make_gui_approval_callback(
+            event_tx.clone(),
+            egui_ctx.clone(),
+            approval_slot.clone(),
+        );
+
+        let mut messages = vec![Message::user(&text)];
+
+        match agent.run(&mut messages, &on_event, &approve).await {
+            Ok(text) => {
+                let _ = event_tx.send(BackendEvent::Done { text });
+                egui_ctx.request_repaint();
+            }
+            Err(AgentError::Cancelled) => {
+                // Already sent via command processor
+            }
+            Err(e) => {
+                let _ = event_tx.send(BackendEvent::Error {
+                    message: e.to_string(),
+                });
+                egui_ctx.request_repaint();
+            }
+        }
+
+        *cancel_slot.lock().unwrap() = None;
+    }
+}
+
+fn make_gui_event_callback(
+    event_tx: std::sync::mpsc::Sender<BackendEvent>,
+    ctx: eframe::egui::Context,
+) -> EventCallback {
+    Box::new(move |event| {
+        let be = match event {
+            AgentEvent::Delta { text, .. } => BackendEvent::Delta { text },
+            AgentEvent::ToolStarted {
+                tool, args_preview, ..
+            } => BackendEvent::ToolStarted { tool, args_preview },
+            AgentEvent::ToolFinished {
+                tool,
+                ok,
+                result_preview,
+                ..
+            } => BackendEvent::ToolFinished {
+                tool,
+                ok,
+                result_preview,
+            },
+            AgentEvent::ApprovalRequest { .. } => return,
+            AgentEvent::Done { .. } => return,
+        };
+        let _ = event_tx.send(be);
+        ctx.request_repaint();
+    })
+}
+
+fn make_gui_approval_callback(
+    event_tx: std::sync::mpsc::Sender<BackendEvent>,
+    ctx: eframe::egui::Context,
+    slot: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<ApprovalDecision>>>>,
+) -> ApprovalCallback {
+    Box::new(move |tool, tier, summary, args| {
+        let event_tx = event_tx.clone();
+        let ctx = ctx.clone();
+        let slot = slot.clone();
+        Box::pin(async move {
+            let approval_id = uuid::Uuid::new_v4().to_string();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            *slot.lock().unwrap() = Some(tx);
+
+            overlay::notify::show_approval_needed(&tool, &summary);
+            let _ = event_tx.send(BackendEvent::ApprovalRequest {
+                approval_id,
+                tool,
+                tier,
+                summary,
+                args,
+            });
+            ctx.request_repaint();
+
+            rx.await.unwrap_or(ApprovalDecision::Deny)
+        })
+    })
+}
+
+fn cmd_install_service() {
+    match service::install_autostart() {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("{} {}", "error:".red().bold(), e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_uninstall_service() {
+    match service::uninstall_autostart() {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("{} {}", "error:".red().bold(), e);
+            std::process::exit(1);
+        }
+    }
+}
+
+// ─── Existing commands ───
 
 fn cmd_version() {
     println!("mi v{}", mi_core::VERSION);
@@ -261,6 +491,7 @@ fn create_agent_loop(api_key: &str, config: &MiConfig, model: &str) -> AgentLoop
         },
         memory_retriever: Some(memory_retriever),
         memory_extractor: Some(memory_extractor),
+        cancel_token: None,
     }
 }
 
@@ -431,7 +662,7 @@ fn cmd_memory(command: MemoryCommands) {
                 return;
             }
             for mem in &memories {
-                let pin = if mem.pinned { " 📌" } else { "" };
+                let pin = if mem.pinned { " (pinned)" } else { "" };
                 println!(
                     "  {} [{}] {}{}",
                     mem.id.chars().take(8).collect::<String>().dimmed(),
@@ -463,7 +694,6 @@ fn cmd_memory(command: MemoryCommands) {
             }
         }
         MemoryCommands::Forget { id } => {
-            // Support both short (8-char prefix) and full IDs
             let full_id = resolve_memory_id(&store, &id);
             match store.forget(&full_id) {
                 Ok(true) => println!("{} Forgotten.", "ok:".green().bold()),
@@ -488,13 +718,21 @@ fn cmd_memory(command: MemoryCommands) {
             let json = serde_json::to_string_pretty(&memories).unwrap();
             if let Some(path) = output {
                 std::fs::write(&path, &json).unwrap();
-                println!("{} Exported {} memories to {}", "ok:".green().bold(), memories.len(), path);
+                println!(
+                    "{} Exported {} memories to {}",
+                    "ok:".green().bold(),
+                    memories.len(),
+                    path
+                );
             } else {
                 println!("{}", json);
             }
         }
         MemoryCommands::Wipe => {
-            print!("{} This will delete ALL memories. Type 'yes' to confirm: ", "warning:".yellow().bold());
+            print!(
+                "{} This will delete ALL memories. Type 'yes' to confirm: ",
+                "warning:".yellow().bold()
+            );
             std::io::stdout().flush().unwrap();
             let mut input = String::new();
             std::io::stdin().read_line(&mut input).ok();
@@ -509,11 +747,9 @@ fn cmd_memory(command: MemoryCommands) {
 }
 
 fn resolve_memory_id(store: &MemoryStore, short_id: &str) -> String {
-    // If it looks like a full UUID, use as-is
     if short_id.len() > 16 {
         return short_id.to_string();
     }
-    // Otherwise search the memory list for a prefix match
     if let Ok(memories) = store.list_memories(1000, 0) {
         for mem in &memories {
             if mem.id.starts_with(short_id) {
@@ -530,13 +766,13 @@ async fn cmd_doctor(fix: bool) {
 
     let api_key = match secrets::get_gemini_key() {
         Ok(Some(key)) if !key.is_empty() => {
-            println!("  {} Gemini API key found in keyring", "✓".green());
+            println!("  {} Gemini API key found in keyring", "ok".green());
             key
         }
         _ => {
             println!(
                 "  {} No Gemini API key. Run: {}",
-                "✗".red(),
+                "err".red(),
                 "mi auth set-gemini-key".cyan()
             );
             return;
@@ -557,7 +793,7 @@ async fn cmd_doctor(fix: bool) {
                 .collect();
             println!(
                 "  {} {} models available ({} support generateContent)",
-                "✓".green(),
+                "ok".green(),
                 models.len(),
                 generate_models.len()
             );
@@ -575,7 +811,7 @@ async fn cmd_doctor(fix: bool) {
             let current = config.active_model().to_string();
             if current.is_empty() {
                 println!();
-                println!("  {} No model configured in [models]", "✗".red());
+                println!("  {} No model configured in [models]", "err".red());
                 if fix {
                     let flash = generate_models.iter().find(|m| {
                         m.id.contains("flash")
@@ -585,9 +821,9 @@ async fn cmd_doctor(fix: bool) {
                     if let Some(m) = flash {
                         config.models.default = m.id.clone();
                         if let Err(e) = config.save() {
-                            eprintln!("  {} Could not save config: {}", "✗".red(), e);
+                            eprintln!("  {} Could not save config: {}", "err".red(), e);
                         } else {
-                            println!("  {} Set default model to {}", "✓".green(), m.id.cyan());
+                            println!("  {} Set default model to {}", "ok".green(), m.id.cyan());
                         }
                     } else {
                         println!(
@@ -604,14 +840,14 @@ async fn cmd_doctor(fix: bool) {
                     println!();
                     println!(
                         "  {} Configured model {} is valid",
-                        "✓".green(),
+                        "ok".green(),
                         current.cyan()
                     );
                 } else {
                     println!();
                     println!(
                         "  {} Configured model {} not found",
-                        "✗".red(),
+                        "err".red(),
                         current.cyan()
                     );
                     if fix {
@@ -623,11 +859,11 @@ async fn cmd_doctor(fix: bool) {
                         if let Some(m) = flash {
                             config.models.default = m.id.clone();
                             if let Err(e) = config.save() {
-                                eprintln!("  {} Could not save config: {}", "✗".red(), e);
+                                eprintln!("  {} Could not save config: {}", "err".red(), e);
                             } else {
                                 println!(
                                     "  {} Updated default model to {}",
-                                    "✓".green(),
+                                    "ok".green(),
                                     m.id.cyan()
                                 );
                             }
@@ -637,26 +873,24 @@ async fn cmd_doctor(fix: bool) {
             }
         }
         Err(e) => {
-            println!("  {} Could not list models: {}", "✗".red(), e);
+            println!("  {} Could not list models: {}", "err".red(), e);
         }
     }
 
-    // Phase 1: show tool count
     let mut registry = ToolRegistry::new();
     builtin::register_all(&mut registry);
     let decls = registry.gemini_declarations();
     println!();
-    println!("  {} {} tools registered", "✓".green(), decls.len());
+    println!("  {} {} tools registered", "ok".green(), decls.len());
 
-    // Phase 2: show memory stats
     let config_for_mem = MiConfig::load().unwrap_or_default();
     match MemoryStore::open(&mi_db_path(), config_for_mem.memory.embed_dim) {
         Ok(store) => {
             let count = store.memory_count().unwrap_or(0);
-            println!("  {} Memory DB open, {} memories stored", "✓".green(), count);
+            println!("  {} Memory DB open, {} memories stored", "ok".green(), count);
         }
         Err(e) => {
-            println!("  {} Memory DB error: {}", "✗".red(), e);
+            println!("  {} Memory DB error: {}", "err".red(), e);
         }
     }
 }
