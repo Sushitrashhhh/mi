@@ -32,7 +32,7 @@ Think of it as Google Assistant or Siri, but for your desktop, running locally, 
 |---|---|
 | **One binary** | A single `mi.exe` is both the background service and the CLI. No runtime, no admin, nothing else to install. |
 | **Native overlay** | A borderless egui bar appears on hotkey (Ctrl+Shift+M), streams responses, shows tool status chips, and fades away when done. |
-| **Push-to-talk voice** | Hold **Ctrl+Space**, speak, release — mi transcribes locally with whisper.cpp, runs the agent, and speaks the answer back. Natural Kokoro voices via a local [Kelados](https://kelados.in/) server (with automatic fallback to the native Windows voice). Fully local, zero cost, no cloud STT/TTS. |
+| **Voice + "hey mi" wake word** | Say **"hey mi"** hands-free, or hold **Ctrl+Space** — mi transcribes locally with whisper.cpp, runs the agent, and speaks the answer back. The wake word is always-on and fully local (reuses the whisper model, no extra account/dependency). Natural Kokoro voices via a local [Kelados](https://kelados.in/) server (with automatic fallback to the native Windows voice). Zero cost, no cloud STT/TTS. |
 | **Vision** | "What's this error on my screen?" — mi captures your screen (or active window) and explains it. Trigger by voice/text (`screen.capture` tool), **Ctrl+Shift+S** (capture then speak), or by dragging an image onto the overlay. Screenshots stay in memory (never written to disk), and screen content taints the turn so risky actions still ask first. |
 | **System tray** | mi lives in your system tray with a context menu. Starts at login via Windows Task Scheduler. |
 | **Agent loop with tools** | mi can plan multi-step actions: open apps, manage files, run shell commands, set timers, search the web — all through natural language. |
@@ -177,6 +177,7 @@ mi/
 │   │       │   ├── tts.rs        # Windows native text-to-speech (WinRT)
 │   │       │   ├── tts_kelados.rs # Kokoro TTS via local Kelados HTTP server
 │   │       │   ├── models.rs     # Whisper GGML model download/management
+│   │       │   ├── wake.rs       # "hey mi" wake-word detector (fuzzy match)
 │   │       │   └── pipeline.rs   # Mic → VAD → STT → agent → TTS orchestration
 │   │       ├── vision/
 │   │       │   ├── capture.rs    # xcap screen/window capture → in-memory PNG
@@ -239,6 +240,8 @@ mi version                Print version
 | **Ctrl+Alt+Esc** | Kill switch — cancel the current agent turn (or stop speaking) |
 | **Enter** | Send message (when overlay is open) |
 | **Escape** | Dismiss the overlay |
+
+Or just say **"hey mi"** — the always-on wake word opens mi hands-free and listens for your command (disable with `wake_enabled = false` in `~/.mi/mi.toml`).
 
 ### Examples
 
@@ -436,13 +439,13 @@ mi is built in phases. Each phase has clear acceptance criteria and tests that m
 | **1** | Agent loop, tools, permissions — 20 tools, policy engine, taint tracking, audit log, injection tests | ✅ Done |
 | **2** | Memory — SQLite + FTS5 + embeddings, hybrid retrieval, extraction, secret filtering, `mi memory` CLI | ✅ Done |
 | **3** | System presence and overlay — egui overlay bar, tray icon, global hotkeys, approval cards, notifications, autostart | ✅ Done |
-| **4** | Voice — push-to-talk (Ctrl+Space), VAD, local whisper.cpp STT, Kokoro/Windows TTS | ✅ Done |
+| **4** | Voice — push-to-talk + always-on "hey mi" wake word, VAD, local whisper.cpp STT, Kokoro/Windows TTS | ✅ Done |
 | **5** | Vision — `screen.capture` tool, Ctrl+Shift+S screenshot-ask, image drop, taint, in-memory only | ✅ Done |
 | **6** | Integrations and scheduling — persistent reminders, Google Calendar/Gmail, Telegram | 🔲 Next |
 | **7** | Offline mode — Ollama provider, local-first fallback | 🔲 |
 | **8** | Hardening and polish — macOS/Linux, installer scripts, onboarding | 🔲 |
 
-> Phase 4 ships push-to-talk end to end. Wake word ("hey mi"), barge-in, and spoken approvals are tracked as voice follow-ups — see [`docs/phase-4.md`](docs/phase-4.md).
+> Phase 4 ships push-to-talk **and the always-on "hey mi" wake word** (local whisper keyword spotting). Barge-in and spoken approvals remain voice follow-ups — see [`docs/phase-4.md`](docs/phase-4.md).
 
 ---
 

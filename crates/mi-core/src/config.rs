@@ -164,6 +164,15 @@ pub struct VoiceConfig {
     pub tts_voice: String,
     #[serde(default = "default_kelados_url")]
     pub kelados_url: String,
+    /// Enable the always-on "hey mi" wake word (listens to the mic continuously).
+    #[serde(default = "default_wake_enabled")]
+    pub wake_enabled: bool,
+    /// The phrase that wakes mi (matched against a local whisper transcript).
+    #[serde(default = "default_wake_word")]
+    pub wake_word: String,
+    /// Match confidence (0.0–1.0) required to trigger a wake.
+    #[serde(default = "default_wake_threshold")]
+    pub wake_threshold: f32,
 }
 
 impl Default for VoiceConfig {
@@ -177,6 +186,9 @@ impl Default for VoiceConfig {
             tts_backend: default_tts_backend(),
             tts_voice: default_tts_voice(),
             kelados_url: default_kelados_url(),
+            wake_enabled: default_wake_enabled(),
+            wake_word: default_wake_word(),
+            wake_threshold: default_wake_threshold(),
         }
     }
 }
@@ -303,7 +315,7 @@ fn default_stt_model() -> String {
     "tiny".into()
 }
 fn default_silence_timeout() -> f32 {
-    8.0
+    2.0
 }
 fn default_vad_threshold() -> f32 {
     0.02
@@ -316,6 +328,15 @@ fn default_tts_voice() -> String {
 }
 fn default_kelados_url() -> String {
     "http://127.0.0.1:8880".into()
+}
+fn default_wake_enabled() -> bool {
+    true
+}
+fn default_wake_word() -> String {
+    "hey mi".into()
+}
+fn default_wake_threshold() -> f32 {
+    0.6
 }
 fn default_redact_screenshots() -> bool {
     true

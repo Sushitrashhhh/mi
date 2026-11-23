@@ -10,6 +10,7 @@ use super::stt::WhisperStt;
 use super::tts::WindowsTts;
 use super::tts_kelados::KeladosTts;
 use super::vad::{VadEvent, VoiceActivityDetector};
+use super::wake::WakeDetector;
 use super::VoiceError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +27,8 @@ pub struct VoicePipeline {
     tts_kelados: Option<Arc<KeladosTts>>,
     capture: Option<Arc<AudioCapture>>,
     recording: Arc<Mutex<Option<RecordingHandle>>>,
+    wake_recording: Arc<Mutex<Option<RecordingHandle>>>,
+    wake_detector: WakeDetector,
     vad: Arc<Mutex<VoiceActivityDetector>>,
     config: VoiceConfig,
     state: Arc<Mutex<VoiceState>>,
@@ -34,6 +37,7 @@ pub struct VoicePipeline {
 impl VoicePipeline {
     pub fn new(config: &VoiceConfig) -> Self {
         let vad = VoiceActivityDetector::new(config.vad_threshold, config.silence_timeout_s);
+        let wake_detector = WakeDetector::new(&config.wake_word, config.wake_threshold);
 
         Self {
             stt: None,
@@ -41,10 +45,16 @@ impl VoicePipeline {
             tts_kelados: None,
             capture: None,
             recording: Arc::new(Mutex::new(None)),
+            wake_recording: Arc::new(Mutex::new(None)),
+            wake_detector,
             vad: Arc::new(Mutex::new(vad)),
             config: config.clone(),
             state: Arc::new(Mutex::new(VoiceState::Idle)),
         }
+    }
+
+    pub fn wake_enabled(&self) -> bool {
+        self.config.wake_enabled
     }
 
     pub async fn init(&mut self) -> Result<(), VoiceError> {
@@ -194,5 +204,65 @@ impl VoicePipeline {
             }
         }
         VadEvent::Silence
+    }
+
+    /// Start always-on capture into a short ring buffer for wake-word polling.
+    pub async fn start_wake_listening(&self) -> Result<(), VoiceError> {
+        let capture = self.capture.as_ref().ok_or(VoiceError::NotInitialized)?;
+        let handle = capture.start_continuous(3.0)?;
+        *self.wake_recording.lock().await = Some(handle);
+        tracing::info!("voice: wake-word listening started");
+        Ok(())
+    }
+
+    /// Stop always-on wake capture (e.g. while a command turn is active).
+    pub async fn stop_wake_listening(&self) {
+        *self.wake_recording.lock().await = None;
+    }
+
+    pub fn is_wake_listening(&self) -> bool {
+        self.wake_recording.try_lock().map(|g| g.is_some()).unwrap_or(true)
+    }
+
+    /// Check the most recent audio window for the wake phrase. Cheap when the
+    /// window is quiet (energy-gated so whisper only runs on actual speech).
+    pub async fn poll_wake(&self) -> bool {
+        let Some(stt) = self.stt.clone() else {
+            return false;
+        };
+
+        let window = {
+            let rec = self.wake_recording.lock().await;
+            let Some(handle) = rec.as_ref() else {
+                return false;
+            };
+            handle.recent_16k(1.6)
+        };
+
+        // Need at least ~0.4s of audio.
+        if window.len() < 6400 {
+            return false;
+        }
+
+        // Energy gate: skip whisper entirely when it's quiet.
+        let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
+        if rms < self.config.vad_threshold {
+            return false;
+        }
+
+        let text = match tokio::task::spawn_blocking(move || stt.transcribe(&window)).await {
+            Ok(Ok(t)) => t,
+            _ => return false,
+        };
+
+        if text.trim().is_empty() {
+            return false;
+        }
+
+        let hit = self.wake_detector.is_wake(&text);
+        if hit {
+            tracing::info!("voice: wake word detected in '{}'", text.trim());
+        }
+        hit
     }
 }

@@ -226,6 +226,8 @@ async fn backend_loop(
         Arc::new(std::sync::Mutex::new(None));
     let cancel_slot: Arc<std::sync::Mutex<Option<CancellationToken>>> =
         Arc::new(std::sync::Mutex::new(None));
+    // True while mi is playing TTS audio, so the wake loop ignores its own voice.
+    let tts_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Initialize voice pipeline
     let mut voice = VoicePipeline::new(&config.voice);
@@ -242,9 +244,61 @@ async fn backend_loop(
         PttStop,
         ScreenshotAsk,
         AttachImage { bytes: Vec<u8>, mime: String },
+        /// Wake word ("hey mi") detected by the background wake loop.
+        WakeCommand,
     }
 
     let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<BackendMsg>(8);
+
+    // Background wake-word loop ("hey mi"): when idle, continuously listen and
+    // trigger a hands-free command on detection. Reuses the loaded whisper model.
+    if config.voice.wake_enabled {
+        let wake_voice = voice.clone();
+        let wake_msg_tx = msg_tx.clone();
+        let wake_tts_active = tts_active.clone();
+        tokio::spawn(async move {
+            use mi_core::voice::pipeline::VoiceState;
+            use std::sync::atomic::Ordering;
+            // Make sure the STT model is available before listening for the wake word.
+            {
+                let mut g = wake_voice.lock().await;
+                if !g.is_stt_ready()
+                    && let Err(e) = g.ensure_stt().await
+                {
+                    tracing::warn!("wake word disabled (no STT model): {}", e);
+                    return;
+                }
+            }
+            tracing::info!("wake word active: say 'hey mi'");
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+                // Don't listen while mi is speaking (avoid self-wake) or mid-turn.
+                if wake_tts_active.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if wake_voice.lock().await.state().await != VoiceState::Idle {
+                    continue;
+                }
+
+                let g = wake_voice.lock().await;
+                if !g.is_wake_listening() {
+                    let _ = g.start_wake_listening().await;
+                    continue; // let the ring buffer fill before polling
+                }
+                let hit = g.poll_wake().await;
+                drop(g);
+
+                if hit {
+                    // Free the mic for the command recording, then dispatch.
+                    wake_voice.lock().await.stop_wake_listening().await;
+                    if wake_msg_tx.send(BackendMsg::WakeCommand).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     // Command processor: blocking thread dispatches commands
     let approval_cmd = approval_slot.clone();
@@ -322,25 +376,121 @@ async fn backend_loop(
                     }
                 }
 
-                // Now start listening (same as PttStart).
-                let mut voice_mut = voice.lock().await;
-                if !voice_mut.is_stt_ready()
-                    && let Err(e) = voice_mut.ensure_stt().await
+                // Hands-free: listen until silence, then run the turn with the screenshot.
                 {
-                    let _ = event_tx.send(BackendEvent::Error {
-                        message: format!("STT model: {}", e),
-                    });
-                    egui_ctx.request_repaint();
-                    continue;
+                    let mut voice_mut = voice.lock().await;
+                    voice_mut.stop_wake_listening().await;
+                    if !voice_mut.is_stt_ready()
+                        && let Err(e) = voice_mut.ensure_stt().await
+                    {
+                        let _ = event_tx.send(BackendEvent::Error {
+                            message: format!("STT model: {}", e),
+                        });
+                        egui_ctx.request_repaint();
+                        continue;
+                    }
+                    if let Err(e) = voice_mut.start_listening().await {
+                        let _ = event_tx.send(BackendEvent::Error {
+                            message: format!("mic: {}", e),
+                        });
+                        egui_ctx.request_repaint();
+                        continue;
+                    }
                 }
                 let _ = event_tx.send(BackendEvent::VoiceListening);
                 egui_ctx.request_repaint();
-                if let Err(e) = voice_mut.start_listening().await {
-                    let _ = event_tx.send(BackendEvent::Error {
-                        message: format!("mic: {}", e),
-                    });
+
+                listen_until_silence(&voice, 12.0).await;
+
+                let _ = event_tx.send(BackendEvent::VoiceTranscribing);
+                egui_ctx.request_repaint();
+                let text = match voice.lock().await.stop_listening_and_transcribe().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = event_tx.send(BackendEvent::Error {
+                            message: format!("transcription: {}", e),
+                        });
+                        egui_ctx.request_repaint();
+                        continue;
+                    }
+                };
+                if text.trim().is_empty() {
+                    let _ = event_tx.send(BackendEvent::VoiceDone);
                     egui_ctx.request_repaint();
+                    continue;
                 }
+                let _ = event_tx.send(BackendEvent::VoiceTranscript { text: text.clone() });
+                egui_ctx.request_repaint();
+
+                run_voice_turn(
+                    &text,
+                    pending_image.take(),
+                    true,
+                    &api_key,
+                    &config,
+                    &model,
+                    &voice,
+                    &event_tx,
+                    &egui_ctx,
+                    &approval_slot,
+                    &cancel_slot,
+                    &tts_active,
+                )
+                .await;
+            }
+            BackendMsg::WakeCommand => {
+                // Wake word detected: free the wake mic, listen hands-free, run the turn.
+                {
+                    let voice_mut = voice.lock().await;
+                    voice_mut.stop_wake_listening().await;
+                    if let Err(e) = voice_mut.start_listening().await {
+                        let _ = event_tx.send(BackendEvent::Error {
+                            message: format!("mic: {}", e),
+                        });
+                        egui_ctx.request_repaint();
+                        continue;
+                    }
+                }
+                let _ = event_tx.send(BackendEvent::VoiceListening);
+                egui_ctx.request_repaint();
+
+                listen_until_silence(&voice, 12.0).await;
+
+                let _ = event_tx.send(BackendEvent::VoiceTranscribing);
+                egui_ctx.request_repaint();
+                let text = match voice.lock().await.stop_listening_and_transcribe().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = event_tx.send(BackendEvent::Error {
+                            message: format!("transcription: {}", e),
+                        });
+                        egui_ctx.request_repaint();
+                        continue;
+                    }
+                };
+                if text.trim().is_empty() {
+                    let _ = event_tx.send(BackendEvent::VoiceDone);
+                    egui_ctx.request_repaint();
+                    continue;
+                }
+                let _ = event_tx.send(BackendEvent::VoiceTranscript { text: text.clone() });
+                egui_ctx.request_repaint();
+
+                run_voice_turn(
+                    &text,
+                    pending_image.take(),
+                    true,
+                    &api_key,
+                    &config,
+                    &model,
+                    &voice,
+                    &event_tx,
+                    &egui_ctx,
+                    &approval_slot,
+                    &cancel_slot,
+                    &tts_active,
+                )
+                .await;
             }
             BackendMsg::AttachImage { bytes, mime } => {
                 use base64::Engine;
@@ -351,6 +501,7 @@ async fn backend_loop(
             }
             BackendMsg::PttStart => {
                 let voice_guard = voice.lock().await;
+                voice_guard.stop_wake_listening().await;
                 if !voice_guard.is_stt_ready() {
                     drop(voice_guard);
                     let _ = event_tx.send(BackendEvent::VoiceListening);
@@ -407,109 +558,135 @@ async fn backend_loop(
                 let _ = event_tx.send(BackendEvent::VoiceTranscript { text: text.clone() });
                 egui_ctx.request_repaint();
 
-                // Run the agent loop with the transcribed text (plus any attached image).
-                let cancel_token = CancellationToken::new();
-                *cancel_slot.lock().unwrap() = Some(cancel_token.clone());
-
-                let turn_image = pending_image.take();
-                let turn_model = if turn_image.is_some() {
-                    config.active_vision_model().to_string()
-                } else {
-                    model.clone()
-                };
-
-                let mut agent = create_agent_loop(&api_key, &config, &turn_model);
-                agent.cancel_token = Some(cancel_token);
-
-                let on_event = make_gui_event_callback(event_tx.clone(), egui_ctx.clone());
-                let approve = make_gui_approval_callback(
-                    event_tx.clone(),
-                    egui_ctx.clone(),
-                    approval_slot.clone(),
-                );
-
-                let mut messages = match turn_image {
-                    Some(img) => vec![Message::user_with_images(&text, vec![img])],
-                    None => vec![Message::user(&text)],
-                };
-
-                match agent.run(&mut messages, &on_event, &approve).await {
-                    Ok(response_text) => {
-                        // Speak the response via TTS
-                        let voice_guard = voice.lock().await;
-                        if voice_guard.is_tts_ready() && !response_text.is_empty() {
-                            let _ = event_tx.send(BackendEvent::VoiceSpeaking);
-                            egui_ctx.request_repaint();
-
-                            match voice_guard.speak(&response_text).await {
-                                Ok(wav_data) if !wav_data.is_empty() => {
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        play_wav_bytes(&wav_data);
-                                    }).await;
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    tracing::warn!("TTS playback failed: {}", e);
-                                }
-                            }
-                        }
-
-                        let _ = event_tx.send(BackendEvent::Done { text: response_text });
-                        egui_ctx.request_repaint();
-                    }
-                    Err(AgentError::Cancelled) => {}
-                    Err(e) => {
-                        let _ = event_tx.send(BackendEvent::Error {
-                            message: e.to_string(),
-                        });
-                        egui_ctx.request_repaint();
-                    }
-                }
-
-                *cancel_slot.lock().unwrap() = None;
+                run_voice_turn(
+                    &text,
+                    pending_image.take(),
+                    true,
+                    &api_key,
+                    &config,
+                    &model,
+                    &voice,
+                    &event_tx,
+                    &egui_ctx,
+                    &approval_slot,
+                    &cancel_slot,
+                    &tts_active,
+                )
+                .await;
             }
             BackendMsg::Text(text) => {
-                let cancel_token = CancellationToken::new();
-                *cancel_slot.lock().unwrap() = Some(cancel_token.clone());
-
-                let turn_image = pending_image.take();
-                let turn_model = if turn_image.is_some() {
-                    config.active_vision_model().to_string()
-                } else {
-                    model.clone()
-                };
-
-                let mut agent = create_agent_loop(&api_key, &config, &turn_model);
-                agent.cancel_token = Some(cancel_token);
-
-                let on_event = make_gui_event_callback(event_tx.clone(), egui_ctx.clone());
-                let approve = make_gui_approval_callback(
-                    event_tx.clone(),
-                    egui_ctx.clone(),
-                    approval_slot.clone(),
-                );
-
-                let mut messages = match turn_image {
-                    Some(img) => vec![Message::user_with_images(&text, vec![img])],
-                    None => vec![Message::user(&text)],
-                };
-
-                match agent.run(&mut messages, &on_event, &approve).await {
-                    Ok(text) => {
-                        let _ = event_tx.send(BackendEvent::Done { text });
-                        egui_ctx.request_repaint();
-                    }
-                    Err(AgentError::Cancelled) => {}
-                    Err(e) => {
-                        let _ = event_tx.send(BackendEvent::Error {
-                            message: e.to_string(),
-                        });
-                        egui_ctx.request_repaint();
-                    }
-                }
-
-                *cancel_slot.lock().unwrap() = None;
+                run_voice_turn(
+                    &text,
+                    pending_image.take(),
+                    false,
+                    &api_key,
+                    &config,
+                    &model,
+                    &voice,
+                    &event_tx,
+                    &egui_ctx,
+                    &approval_slot,
+                    &cancel_slot,
+                    &tts_active,
+                )
+                .await;
             }
+        }
+    }
+}
+
+type ApprovalSlot =
+    Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<ApprovalDecision>>>>;
+type CancelSlot = Arc<std::sync::Mutex<Option<CancellationToken>>>;
+type VoiceHandle = Arc<tokio::sync::Mutex<VoicePipeline>>;
+
+/// Run one conversational turn: build the agent, run it, and (optionally) speak
+/// the reply. Routes image turns to the vision model. Shared by voice and text.
+#[allow(clippy::too_many_arguments)]
+async fn run_voice_turn(
+    text: &str,
+    image: Option<ImageData>,
+    speak: bool,
+    api_key: &str,
+    config: &MiConfig,
+    default_model: &str,
+    voice: &VoiceHandle,
+    event_tx: &std::sync::mpsc::Sender<overlay::state::BackendEvent>,
+    egui_ctx: &eframe::egui::Context,
+    approval_slot: &ApprovalSlot,
+    cancel_slot: &CancelSlot,
+    tts_active: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    use overlay::state::BackendEvent;
+    use std::sync::atomic::Ordering;
+
+    let cancel_token = CancellationToken::new();
+    *cancel_slot.lock().unwrap() = Some(cancel_token.clone());
+
+    let model = if image.is_some() {
+        config.active_vision_model().to_string()
+    } else {
+        default_model.to_string()
+    };
+
+    let mut agent = create_agent_loop(api_key, config, &model);
+    agent.cancel_token = Some(cancel_token);
+
+    let on_event = make_gui_event_callback(event_tx.clone(), egui_ctx.clone());
+    let approve =
+        make_gui_approval_callback(event_tx.clone(), egui_ctx.clone(), approval_slot.clone());
+
+    let mut messages = match image {
+        Some(img) => vec![Message::user_with_images(text, vec![img])],
+        None => vec![Message::user(text)],
+    };
+
+    match agent.run(&mut messages, &on_event, &approve).await {
+        Ok(response_text) => {
+            if speak {
+                let guard = voice.lock().await;
+                if guard.is_tts_ready() && !response_text.is_empty() {
+                    let _ = event_tx.send(BackendEvent::VoiceSpeaking);
+                    egui_ctx.request_repaint();
+                    // Pause the wake loop so mi doesn't hear its own voice.
+                    tts_active.store(true, Ordering::Relaxed);
+                    match guard.speak(&response_text).await {
+                        Ok(wav) if !wav.is_empty() => {
+                            let _ = tokio::task::spawn_blocking(move || play_wav_bytes(&wav)).await;
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("TTS playback failed: {}", e),
+                    }
+                    tts_active.store(false, Ordering::Relaxed);
+                }
+            }
+            let _ = event_tx.send(BackendEvent::Done {
+                text: response_text,
+            });
+            egui_ctx.request_repaint();
+        }
+        Err(AgentError::Cancelled) => {}
+        Err(e) => {
+            let _ = event_tx.send(BackendEvent::Error {
+                message: e.to_string(),
+            });
+            egui_ctx.request_repaint();
+        }
+    }
+
+    *cancel_slot.lock().unwrap() = None;
+}
+
+/// Block until the user stops speaking (VAD silence) or `max_secs` elapses.
+async fn listen_until_silence(voice: &VoiceHandle, max_secs: f32) {
+    let start = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        if start.elapsed().as_secs_f32() >= max_secs {
+            break;
+        }
+        if voice.lock().await.check_vad().await == mi_core::voice::vad::VadEvent::SilenceTimeout {
+            break;
         }
     }
 }

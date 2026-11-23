@@ -31,9 +31,20 @@ impl AudioCapture {
         Ok(Self { device, config })
     }
 
+    /// Record into an unbounded buffer (push-to-talk: `finish()` returns the whole take).
     pub fn start_recording(&self) -> Result<RecordingHandle, VoiceError> {
+        self.start_capped(0)
+    }
+
+    /// Record continuously, keeping only the most recent `max_seconds` of audio
+    /// (a ring buffer for always-on wake-word listening).
+    pub fn start_continuous(&self, max_seconds: f32) -> Result<RecordingHandle, VoiceError> {
+        let cap = (self.config.sample_rate() as f32 * max_seconds) as usize;
+        self.start_capped(cap.max(1))
+    }
+
+    fn start_capped(&self, cap: usize) -> Result<RecordingHandle, VoiceError> {
         let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-        let buf_clone = buffer.clone();
         let channels = self.config.channels() as usize;
 
         let err_fn = |e: cpal::Error| {
@@ -41,17 +52,18 @@ impl AudioCapture {
         };
 
         let stream = match self.config.sample_format() {
-            cpal::SampleFormat::F32 => self.device.build_input_stream(
-                self.config.config(),
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    let mono = to_mono(data, channels);
-                    if let Ok(mut buf) = buf_clone.lock() {
-                        buf.extend_from_slice(&mono);
-                    }
-                },
-                err_fn,
-                None,
-            ),
+            cpal::SampleFormat::F32 => {
+                let buf_clone = buffer.clone();
+                self.device.build_input_stream(
+                    self.config.config(),
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        let mono = to_mono(data, channels);
+                        append_capped(&buf_clone, &mono, cap);
+                    },
+                    err_fn,
+                    None,
+                )
+            }
             cpal::SampleFormat::I16 => {
                 let buf_clone = buffer.clone();
                 self.device.build_input_stream(
@@ -60,9 +72,7 @@ impl AudioCapture {
                         let floats: Vec<f32> =
                             data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
                         let mono = to_mono(&floats, channels);
-                        if let Ok(mut buf) = buf_clone.lock() {
-                            buf.extend_from_slice(&mono);
-                        }
+                        append_capped(&buf_clone, &mono, cap);
                     },
                     err_fn,
                     None,
@@ -76,9 +86,7 @@ impl AudioCapture {
                         let floats: Vec<f32> =
                             data.iter().map(|&s| s as f32 / i32::MAX as f32).collect();
                         let mono = to_mono(&floats, channels);
-                        if let Ok(mut buf) = buf_clone.lock() {
-                            buf.extend_from_slice(&mono);
-                        }
+                        append_capped(&buf_clone, &mono, cap);
                     },
                     err_fn,
                     None,
@@ -105,6 +113,17 @@ impl AudioCapture {
     }
 }
 
+/// Append `mono` to `buf`; if `cap > 0`, keep only the last `cap` samples.
+fn append_capped(buf: &Arc<Mutex<Vec<f32>>>, mono: &[f32], cap: usize) {
+    if let Ok(mut buf) = buf.lock() {
+        buf.extend_from_slice(mono);
+        if cap > 0 && buf.len() > cap {
+            let excess = buf.len() - cap;
+            buf.drain(0..excess);
+        }
+    }
+}
+
 impl RecordingHandle {
     pub fn get_samples(&self) -> Vec<f32> {
         self.buffer.lock().unwrap_or_else(|p| p.into_inner()).clone()
@@ -122,6 +141,20 @@ impl RecordingHandle {
         }
 
         resample(&raw, self.source_sample_rate, TARGET_SAMPLE_RATE)
+    }
+
+    /// The most recent `seconds` of audio, resampled to 16 kHz (for wake polling).
+    /// Does not consume the handle, so continuous capture keeps running.
+    pub fn recent_16k(&self, seconds: f32) -> Vec<f32> {
+        let raw = self.buffer.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let want = (self.source_sample_rate as f32 * seconds) as usize;
+        let start = raw.len().saturating_sub(want);
+        let window = &raw[start..];
+        if self.source_sample_rate == TARGET_SAMPLE_RATE {
+            window.to_vec()
+        } else {
+            resample(window, self.source_sample_rate, TARGET_SAMPLE_RATE)
+        }
     }
 }
 

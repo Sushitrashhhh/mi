@@ -117,10 +117,28 @@ cargo clippy -- -D warnings
 - CMake (for whisper.cpp C compilation)
 - LLVM with libclang.dll (for whisper-rs-sys bindgen)
 
+## Wake word ("hey mi") — added after Phase 5
+- Always-on, fully local keyword spotting that **reuses the loaded whisper model**
+  (no new account, API, or dependency — fits the zero-cost/local rule).
+- `voice/wake.rs` — `WakeDetector`: normalizes a transcript and scores it against
+  the phrase with **word-structured** fuzzy matching (per-word similarity over
+  sliding windows), so unrelated speech stays well below threshold.
+- `voice/capture.rs` — `start_continuous(secs)` ring buffer + `recent_16k()` for
+  non-destructive polling.
+- `pipeline.rs` — `poll_wake()` is **energy-gated**: whisper only runs when the mic
+  window actually has speech, so idle CPU stays near zero.
+- `main.rs` — a background wake loop (guarded by `VoiceState` and a TTS-active flag
+  so mi never wakes itself) triggers a hands-free command turn: listen until VAD
+  silence → transcribe → agent → spoken reply.
+- Config: `voice.wake_enabled` (default true), `voice.wake_word` ("hey mi"),
+  `voice.wake_threshold` (0.6). `silence_timeout_s` lowered to 2.0 for snappy
+  hands-free auto-stop.
+- The same hands-free listen path also powers Ctrl+Shift+S screenshot-ask.
+
 ## Known gaps
-- Wake word not yet implemented (future: Porcupine or custom keyword spotter)
 - Barge-in not yet implemented (config exists, logic pending)
 - Live/streaming mode not yet implemented (config exists, pipeline only)
 - Spoken approval flow not yet implemented ("Send… commands ask for a spoken yes")
+- Wake accuracy depends on whisper `tiny`; false-wake rate is tunable via `wake_threshold`
 - No model selection UI — change `stt_model` in `~/.mi/mi.toml`
 - Latency target (<2 s) depends on hardware and whisper model size

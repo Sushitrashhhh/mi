@@ -5,6 +5,7 @@ pub mod stt;
 pub mod tts;
 pub mod tts_kelados;
 pub mod vad;
+pub mod wake;
 
 use thiserror::Error;
 
