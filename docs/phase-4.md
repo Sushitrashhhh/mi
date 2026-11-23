@@ -1,0 +1,120 @@
+# Phase 4: Voice
+
+## What was built
+
+### Audio capture (`mi-core/voice/capture.rs`)
+- Opens default input device via `cpal` 0.18
+- Handles F32, I16, I32 sample formats with stereo→mono conversion
+- Linear interpolation resampling to 16 kHz (whisper's native rate)
+- `AudioCapture::start_recording()` → `RecordingHandle` for async buffering
+- `RecordingHandle::finish()` returns final `Vec<f32>` at 16 kHz mono
+
+### Voice Activity Detection (`mi-core/voice/vad.rs`)
+- Energy-based VAD using RMS threshold (configurable `vad_threshold`)
+- Three events: `Speech`, `Silence`, `SilenceTimeout`
+- Configurable silence timeout (default 8 s)
+
+### Local STT via whisper.cpp (`mi-core/voice/stt.rs`)
+- Rust bindings via `whisper-rs` 0.16 (whisper.cpp under the hood)
+- Fully local, free, zero-cost — no cloud API calls
+- Greedy decoding, single-segment, English, up to 4 threads
+- GGML model files stored in `~/.mi/models/`
+
+### Model management (`mi-core/voice/models.rs`)
+- Downloads whisper GGML models from HuggingFace on first use
+- Atomic writes (`.part` file → rename) to avoid corruption
+- Supports any model size: tiny, base, small, medium, large
+- Default: `tiny` (~75 MB, fastest)
+
+### Windows native TTS (`mi-core/voice/tts.rs`)
+- Uses `windows` 0.62 WinRT `SpeechSynthesizer` — free, local, zero cost
+- Synthesizes text to WAV bytes via `SynthesizeTextToStreamAsync`
+- Blocks on WinRT async via `futures::executor::block_on`
+- Non-Windows stub returns error gracefully
+
+### Voice pipeline (`mi-core/voice/pipeline.rs`)
+- Orchestrates: Mic → VAD → Whisper STT → Agent Loop → Windows TTS → Playback
+- Lazy model download: `ensure_stt()` downloads on first voice use
+- CPU-heavy work (STT, TTS) runs in `tokio::task::spawn_blocking`
+- State machine: Idle → Listening → Transcribing → Speaking → Idle
+
+### Audio playback (`mi-bin/main.rs`)
+- Uses `rodio` 0.23 with `DeviceSinkBuilder` and `Player`
+- `play_wav_bytes()` runs in `spawn_blocking` to avoid blocking async runtime
+
+### PTT hotkey (`mi-bin/overlay/hotkeys.rs`)
+- **Ctrl+Space** — press to start listening, release to transcribe and send
+- Registered alongside existing Ctrl+Shift+M (type mode) and Ctrl+Alt+Esc (kill switch)
+
+### Overlay voice UI (`mi-bin/overlay/app.rs`)
+- Three new phases: `Listening`, `Transcribing`, `Speaking`
+- **Listening**: animated audio bars (5 red bars with sine-wave heights)
+- **Transcribing**: pulsing amber dots animation
+- **Speaking**: pulsing green circles animation
+- Status dot in header changes color for voice phases
+- Footer hints update: "Ctrl+Space to talk" / "release Ctrl+Space to send"
+- Kill switch cancels Speaking phase too
+
+### Backend integration (`mi-bin/main.rs`)
+- Voice pipeline initialized on startup, wrapped in `Arc<Mutex>`
+- Internal `BackendMsg` enum: `Text(String)`, `PttStart`, `PttStop`
+- PttStart: ensures STT ready (downloads model if needed), starts mic capture
+- PttStop: transcribes audio, runs agent loop, speaks response, plays WAV
+
+### Configuration (`mi-core/config.rs`, `config/mi.example.toml`)
+```toml
+[voice]
+pipeline = "pipeline"       # "pipeline" (PTT) or "live" (future streaming)
+stt_model = "tiny"          # whisper model size
+silence_timeout_s = 8.0
+vad_threshold = 0.02
+barge_in = false            # future: interrupt TTS with new speech
+```
+
+## How to run
+
+```sh
+# Start the assistant (overlay + voice)
+cargo run -p mi-bin
+
+# Build requirements:
+#   - CMake (for whisper.cpp compilation)
+#   - LLVM/libclang (for whisper-rs-sys bindgen)
+# Set env vars if not in PATH:
+#   LIBCLANG_PATH="C:\Program Files\LLVM\bin"
+
+# Voice usage:
+#   1. Hold Ctrl+Space to start listening
+#   2. Speak your query
+#   3. Release Ctrl+Space — mi transcribes and responds
+#   4. Hear the spoken answer via Windows TTS
+# The whisper model (~75 MB for tiny) downloads automatically on first use.
+
+# Tests
+cargo test
+
+# Lint
+cargo clippy -- -D warnings
+```
+
+## Dependencies added
+
+### mi-core
+- `cpal` 0.18 — cross-platform audio capture
+- `whisper-rs` 0.16 — local STT via whisper.cpp
+- `windows` 0.62 (features: `Media_SpeechSynthesis`, `Media_Core`, `Foundation`, `Storage_Streams`) — Windows TTS
+
+### mi-bin
+- `rodio` 0.23 — audio playback
+
+### Build-time requirements
+- CMake (for whisper.cpp C compilation)
+- LLVM with libclang.dll (for whisper-rs-sys bindgen)
+
+## Known gaps
+- Wake word not yet implemented (future: Porcupine or custom keyword spotter)
+- Barge-in not yet implemented (config exists, logic pending)
+- Live/streaming mode not yet implemented (config exists, pipeline only)
+- Spoken approval flow not yet implemented ("Send… commands ask for a spoken yes")
+- No model selection UI — change `stt_model` in `~/.mi/mi.toml`
+- Latency target (<2 s) depends on hardware and whisper model size

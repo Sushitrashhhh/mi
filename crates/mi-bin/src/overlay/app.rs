@@ -31,9 +31,12 @@ const RED: egui::Color32 = egui::Color32::from_rgb(248, 113, 113);
 enum Phase {
     Hidden,
     Input,
+    Listening,
+    Transcribing,
     Thinking,
     Responding,
     Approval,
+    Speaking,
     Done,
 }
 
@@ -112,7 +115,7 @@ impl MiOverlay {
     }
 
     fn show(&mut self, ctx: &egui::Context) {
-        if self.phase != Phase::Hidden && self.phase != Phase::Done {
+        if self.phase != Phase::Hidden && self.phase != Phase::Done && self.phase != Phase::Input {
             return;
         }
         self.phase = Phase::Input;
@@ -155,7 +158,26 @@ impl MiOverlay {
 
     fn poll_hotkey_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
-            if event.state == global_hotkey::HotKeyState::Pressed {
+            if event.id == self.hotkey_ids.ptt {
+                match event.state {
+                    global_hotkey::HotKeyState::Pressed => {
+                        if self.phase == Phase::Hidden || self.phase == Phase::Done || self.phase == Phase::Input {
+                            self.show(ctx);
+                            self.phase = Phase::Listening;
+                            self.response_text.clear();
+                            self.tool_chips.clear();
+                            self.last_error = None;
+                            let _ = self.cmd_tx.send(UiCommand::PttStart);
+                        }
+                    }
+                    global_hotkey::HotKeyState::Released => {
+                        if self.phase == Phase::Listening {
+                            self.phase = Phase::Transcribing;
+                            let _ = self.cmd_tx.send(UiCommand::PttStop);
+                        }
+                    }
+                }
+            } else if event.state == global_hotkey::HotKeyState::Pressed {
                 if event.id == self.hotkey_ids.type_mode {
                     if self.phase == Phase::Hidden || self.phase == Phase::Done {
                         self.show(ctx);
@@ -164,7 +186,7 @@ impl MiOverlay {
                     }
                 } else if event.id == self.hotkey_ids.kill_switch {
                     let _ = self.cmd_tx.send(UiCommand::CancelTurn);
-                    if self.phase == Phase::Thinking || self.phase == Phase::Responding {
+                    if self.phase == Phase::Thinking || self.phase == Phase::Responding || self.phase == Phase::Speaking {
                         self.last_error = Some("cancelled".into());
                         self.phase = Phase::Done;
                         self.done_at = Some(Instant::now());
@@ -231,6 +253,22 @@ impl MiOverlay {
                     self.phase = Phase::Done;
                     self.done_at = Some(Instant::now());
                 }
+                BackendEvent::VoiceListening => {
+                    self.phase = Phase::Listening;
+                }
+                BackendEvent::VoiceTranscribing => {
+                    self.phase = Phase::Transcribing;
+                }
+                BackendEvent::VoiceTranscript { text } => {
+                    self.input_text = text;
+                }
+                BackendEvent::VoiceSpeaking => {
+                    self.phase = Phase::Speaking;
+                }
+                BackendEvent::VoiceDone => {
+                    self.phase = Phase::Done;
+                    self.done_at = Some(Instant::now());
+                }
             }
             ctx.request_repaint();
         }
@@ -264,12 +302,27 @@ impl MiOverlay {
                     ui.add_space(8.0);
                 }
 
+                // Listening animation
+                if self.phase == Phase::Listening {
+                    self.render_listening(ui);
+                }
+
+                // Transcribing indicator
+                if self.phase == Phase::Transcribing {
+                    self.render_transcribing(ui);
+                }
+
                 // Tool chips
                 self.render_tool_chips(ui);
 
                 // Thinking animation
                 if self.phase == Phase::Thinking && self.tool_chips.is_empty() {
                     self.render_thinking(ui);
+                }
+
+                // Speaking indicator
+                if self.phase == Phase::Speaking {
+                    self.render_speaking(ui);
                 }
 
                 // Response
@@ -312,9 +365,12 @@ impl MiOverlay {
             );
             let color = match self.phase {
                 Phase::Input => ACCENT,
+                Phase::Listening => RED,
+                Phase::Transcribing => AMBER,
                 Phase::Thinking => AMBER,
                 Phase::Responding => ACCENT_LIGHT,
                 Phase::Approval => AMBER,
+                Phase::Speaking => GREEN,
                 Phase::Done => GREEN,
                 Phase::Hidden => ACCENT,
             };
@@ -332,9 +388,12 @@ impl MiOverlay {
 
             let status = match self.phase {
                 Phase::Input => "ready",
+                Phase::Listening => "listening...",
+                Phase::Transcribing => "transcribing...",
                 Phase::Thinking => "thinking...",
                 Phase::Responding => "responding",
                 Phase::Approval => "needs approval",
+                Phase::Speaking => "speaking...",
                 Phase::Done => "done",
                 Phase::Hidden => "",
             };
@@ -591,13 +650,88 @@ impl MiOverlay {
             });
     }
 
+    fn render_listening(&self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let t = ui.input(|i| i.time);
+            for i in 0..5 {
+                let phase = t * 4.0 + i as f64 * 0.6;
+                let height = (phase.sin() * 0.5 + 0.5) * 16.0 + 4.0;
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(4.0, 20.0),
+                    egui::Sense::hover(),
+                );
+                let bar_rect = egui::Rect::from_center_size(
+                    rect.center(),
+                    egui::vec2(3.0, height as f32),
+                );
+                ui.painter().rect_filled(bar_rect, 1.5, RED);
+                ui.add_space(1.0);
+            }
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("listening...")
+                    .color(RED)
+                    .size(13.0)
+                    .strong(),
+            );
+        });
+        ui.ctx().request_repaint();
+    }
+
+    fn render_transcribing(&self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let t = ui.input(|i| i.time);
+            for i in 0..3 {
+                let phase = t * 3.0 + i as f64 * 0.8;
+                let alpha = ((phase.sin() * 0.5 + 0.5) * 180.0 + 75.0) as u8;
+                let color = egui::Color32::from_rgba_unmultiplied(
+                    AMBER.r(), AMBER.g(), AMBER.b(), alpha,
+                );
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(6.0, 6.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().circle_filled(rect.center(), 3.0, color);
+                ui.add_space(2.0);
+            }
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("transcribing...").color(AMBER).size(12.0));
+        });
+        ui.ctx().request_repaint();
+    }
+
+    fn render_speaking(&self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let t = ui.input(|i| i.time);
+            for i in 0..4 {
+                let phase = t * 2.5 + i as f64 * 0.7;
+                let scale = (phase.sin() * 0.3 + 0.7) as f32;
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(6.0, 6.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().circle_filled(rect.center(), 3.0 * scale, GREEN);
+                ui.add_space(2.0);
+            }
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("speaking...").color(GREEN).size(12.0));
+        });
+        ui.ctx().request_repaint();
+    }
+
     fn render_footer(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let hints = match self.phase {
-                Phase::Input => "Enter to send \u{00B7} Esc to close",
+                Phase::Input => "Enter to send \u{00B7} Ctrl+Space to talk \u{00B7} Esc to close",
+                Phase::Listening => "release Ctrl+Space to send",
+                Phase::Transcribing => "transcribing speech...",
                 Phase::Thinking | Phase::Responding => "Ctrl+Alt+Esc to cancel",
                 Phase::Approval => "choose an action above",
-                Phase::Done => "Ctrl+Shift+M to reopen",
+                Phase::Speaking => "Ctrl+Alt+Esc to stop",
+                Phase::Done => "Ctrl+Shift+M to reopen \u{00B7} Ctrl+Space to talk",
                 Phase::Hidden => "",
             };
             ui.label(egui::RichText::new(hints).color(TEXT_DIM).size(10.5));

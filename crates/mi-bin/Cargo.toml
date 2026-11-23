@@ -56,3 +56,6 @@ tokio-util = "0.7"
 
 # Home directory (for instance lock PID file)
 dirs = "6"
+
+# Phase 4: audio playback for TTS output
+rodio = "0.23"

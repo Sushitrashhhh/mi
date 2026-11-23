@@ -28,6 +28,7 @@ use mi_core::tools::builtin;
 use mi_core::tools::os_adapt;
 use mi_core::tools::registry::ToolRegistry;
 use mi_core::tools::ToolExecutor;
+use mi_core::voice::pipeline::VoicePipeline;
 
 use overlay::state::{BackendEvent, UiCommand};
 
@@ -226,7 +227,22 @@ async fn backend_loop(
     let cancel_slot: Arc<std::sync::Mutex<Option<CancellationToken>>> =
         Arc::new(std::sync::Mutex::new(None));
 
-    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<String>(8);
+    // Initialize voice pipeline
+    let mut voice = VoicePipeline::new(&config.voice);
+    match voice.init().await {
+        Ok(()) => tracing::info!("voice pipeline initialized"),
+        Err(e) => tracing::warn!("voice pipeline init failed (voice disabled): {}", e),
+    }
+    let voice = Arc::new(tokio::sync::Mutex::new(voice));
+
+    #[derive(Debug)]
+    enum BackendMsg {
+        Text(String),
+        PttStart,
+        PttStop,
+    }
+
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<BackendMsg>(8);
 
     // Command processor: blocking thread dispatches commands
     let approval_cmd = approval_slot.clone();
@@ -237,7 +253,7 @@ async fn backend_loop(
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
                 UiCommand::SendMessage(text) => {
-                    let _ = msg_tx.blocking_send(text);
+                    let _ = msg_tx.blocking_send(BackendMsg::Text(text));
                 }
                 UiCommand::ApprovalResponse { decision, .. } => {
                     if let Some(tx) = approval_cmd.lock().unwrap().take() {
@@ -251,45 +267,183 @@ async fn backend_loop(
                     let _ = event_tx_cmd.send(BackendEvent::Cancelled);
                     egui_ctx_cmd.request_repaint();
                 }
+                UiCommand::PttStart => {
+                    let _ = msg_tx.blocking_send(BackendMsg::PttStart);
+                }
+                UiCommand::PttStop => {
+                    let _ = msg_tx.blocking_send(BackendMsg::PttStop);
+                }
                 UiCommand::Quit => break,
             }
         }
     });
 
-    // Message handler: runs agent loop per message
-    while let Some(text) = msg_rx.recv().await {
-        let cancel_token = CancellationToken::new();
-        *cancel_slot.lock().unwrap() = Some(cancel_token.clone());
+    // Message handler: runs agent loop per message (text or voice)
+    while let Some(msg) = msg_rx.recv().await {
+        match msg {
+            BackendMsg::PttStart => {
+                let voice_guard = voice.lock().await;
+                if !voice_guard.is_stt_ready() {
+                    drop(voice_guard);
+                    let _ = event_tx.send(BackendEvent::VoiceListening);
+                    egui_ctx.request_repaint();
 
-        let mut agent = create_agent_loop(&api_key, &config, &model);
-        agent.cancel_token = Some(cancel_token);
-
-        let on_event = make_gui_event_callback(event_tx.clone(), egui_ctx.clone());
-        let approve = make_gui_approval_callback(
-            event_tx.clone(),
-            egui_ctx.clone(),
-            approval_slot.clone(),
-        );
-
-        let mut messages = vec![Message::user(&text)];
-
-        match agent.run(&mut messages, &on_event, &approve).await {
-            Ok(text) => {
-                let _ = event_tx.send(BackendEvent::Done { text });
-                egui_ctx.request_repaint();
+                    let mut voice_mut = voice.lock().await;
+                    if let Err(e) = voice_mut.ensure_stt().await {
+                        let _ = event_tx.send(BackendEvent::Error {
+                            message: format!("STT model: {}", e),
+                        });
+                        egui_ctx.request_repaint();
+                        continue;
+                    }
+                    if let Err(e) = voice_mut.start_listening().await {
+                        let _ = event_tx.send(BackendEvent::Error {
+                            message: format!("mic: {}", e),
+                        });
+                        egui_ctx.request_repaint();
+                    }
+                } else {
+                    let _ = event_tx.send(BackendEvent::VoiceListening);
+                    egui_ctx.request_repaint();
+                    if let Err(e) = voice_guard.start_listening().await {
+                        let _ = event_tx.send(BackendEvent::Error {
+                            message: format!("mic: {}", e),
+                        });
+                        egui_ctx.request_repaint();
+                    }
+                }
             }
-            Err(AgentError::Cancelled) => {
-                // Already sent via command processor
-            }
-            Err(e) => {
-                let _ = event_tx.send(BackendEvent::Error {
-                    message: e.to_string(),
-                });
+            BackendMsg::PttStop => {
+                let _ = event_tx.send(BackendEvent::VoiceTranscribing);
                 egui_ctx.request_repaint();
+
+                let voice_guard = voice.lock().await;
+                let text = match voice_guard.stop_listening_and_transcribe().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = event_tx.send(BackendEvent::Error {
+                            message: format!("transcription: {}", e),
+                        });
+                        egui_ctx.request_repaint();
+                        continue;
+                    }
+                };
+                drop(voice_guard);
+
+                if text.is_empty() {
+                    let _ = event_tx.send(BackendEvent::VoiceDone);
+                    egui_ctx.request_repaint();
+                    continue;
+                }
+
+                let _ = event_tx.send(BackendEvent::VoiceTranscript { text: text.clone() });
+                egui_ctx.request_repaint();
+
+                // Run the agent loop with the transcribed text
+                let cancel_token = CancellationToken::new();
+                *cancel_slot.lock().unwrap() = Some(cancel_token.clone());
+
+                let mut agent = create_agent_loop(&api_key, &config, &model);
+                agent.cancel_token = Some(cancel_token);
+
+                let on_event = make_gui_event_callback(event_tx.clone(), egui_ctx.clone());
+                let approve = make_gui_approval_callback(
+                    event_tx.clone(),
+                    egui_ctx.clone(),
+                    approval_slot.clone(),
+                );
+
+                let mut messages = vec![Message::user(&text)];
+
+                match agent.run(&mut messages, &on_event, &approve).await {
+                    Ok(response_text) => {
+                        // Speak the response via TTS
+                        let voice_guard = voice.lock().await;
+                        if voice_guard.is_tts_ready() && !response_text.is_empty() {
+                            let _ = event_tx.send(BackendEvent::VoiceSpeaking);
+                            egui_ctx.request_repaint();
+
+                            match voice_guard.speak(&response_text).await {
+                                Ok(wav_data) if !wav_data.is_empty() => {
+                                    let _ = tokio::task::spawn_blocking(move || {
+                                        play_wav_bytes(&wav_data);
+                                    }).await;
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!("TTS playback failed: {}", e);
+                                }
+                            }
+                        }
+
+                        let _ = event_tx.send(BackendEvent::Done { text: response_text });
+                        egui_ctx.request_repaint();
+                    }
+                    Err(AgentError::Cancelled) => {}
+                    Err(e) => {
+                        let _ = event_tx.send(BackendEvent::Error {
+                            message: e.to_string(),
+                        });
+                        egui_ctx.request_repaint();
+                    }
+                }
+
+                *cancel_slot.lock().unwrap() = None;
+            }
+            BackendMsg::Text(text) => {
+                let cancel_token = CancellationToken::new();
+                *cancel_slot.lock().unwrap() = Some(cancel_token.clone());
+
+                let mut agent = create_agent_loop(&api_key, &config, &model);
+                agent.cancel_token = Some(cancel_token);
+
+                let on_event = make_gui_event_callback(event_tx.clone(), egui_ctx.clone());
+                let approve = make_gui_approval_callback(
+                    event_tx.clone(),
+                    egui_ctx.clone(),
+                    approval_slot.clone(),
+                );
+
+                let mut messages = vec![Message::user(&text)];
+
+                match agent.run(&mut messages, &on_event, &approve).await {
+                    Ok(text) => {
+                        let _ = event_tx.send(BackendEvent::Done { text });
+                        egui_ctx.request_repaint();
+                    }
+                    Err(AgentError::Cancelled) => {}
+                    Err(e) => {
+                        let _ = event_tx.send(BackendEvent::Error {
+                            message: e.to_string(),
+                        });
+                        egui_ctx.request_repaint();
+                    }
+                }
+
+                *cancel_slot.lock().unwrap() = None;
             }
         }
+    }
+}
 
-        *cancel_slot.lock().unwrap() = None;
+fn play_wav_bytes(wav_data: &[u8]) {
+    use rodio::DeviceSinkBuilder;
+    use std::io::Cursor;
+
+    let handle = match DeviceSinkBuilder::open_default_sink() {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!("no audio output device: {}", e);
+            return;
+        }
+    };
+    let mixer = handle.mixer();
+    let cursor = Cursor::new(wav_data.to_vec());
+    match rodio::stream::play(mixer, cursor) {
+        Ok(player) => {
+            player.sleep_until_end();
+        }
+        Err(e) => tracing::warn!("failed to decode TTS audio: {}", e),
     }
 }
 

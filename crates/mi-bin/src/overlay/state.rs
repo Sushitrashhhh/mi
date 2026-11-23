@@ -9,6 +9,8 @@ pub enum UiCommand {
         decision: ApprovalDecision,
     },
     CancelTurn,
+    PttStart,
+    PttStop,
     Quit,
 }
 
@@ -27,4 +29,9 @@ pub enum BackendEvent {
     Done { text: String },
     Error { message: String },
     Cancelled,
+    VoiceListening,
+    VoiceTranscribing,
+    VoiceTranscript { text: String },
+    VoiceSpeaking,
+    VoiceDone,
 }

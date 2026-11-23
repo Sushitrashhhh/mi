@@ -13,3 +13,10 @@ live = ""
 tts = ""
 embed = ""
 local = "llama3.2:3b"
+
+[voice]
+pipeline = "pipeline"          # "pipeline" (VAD + whisper + TTS) | "live" (future)
+stt_model = "tiny"             # whisper model size: "tiny" (~75MB) | "base" (~150MB)
+silence_timeout_s = 8.0        # seconds of silence before auto-stop recording
+vad_threshold = 0.02           # RMS energy threshold for voice activity
+barge_in = false               # interrupt TTS playback with new speech

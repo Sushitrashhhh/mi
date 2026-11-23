@@ -48,6 +48,21 @@ regex = "1.11"
 # CancellationToken for kill switch / turn cancellation
 tokio-util = "0.7"
 
+# Voice (Phase 4): audio capture
+cpal = "0.18"
+
+# Voice (Phase 4): local STT via whisper.cpp
+whisper-rs = "0.16"
+
+[target.'cfg(windows)'.dependencies]
+# Voice (Phase 4): Windows native TTS via WinRT Speech Synthesis
+windows = { version = "0.62", features = [
+    "Media_SpeechSynthesis",
+    "Media_Core",
+    "Foundation",
+    "Storage_Streams",
+] }
+
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"

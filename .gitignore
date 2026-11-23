@@ -2,6 +2,9 @@
 /target/
 *.pdb
 
+# Machine-specific build config (LIBCLANG_PATH / CMAKE absolute paths)
+/.cargo/config.toml
+
 # Secrets
 .env
 *.key

@@ -24,7 +24,7 @@
 
 Think of it as Google Assistant or Siri, but for your desktop, running locally, and you own every byte of your data.
 
-**Current status:** Phase 3 complete — native overlay bar with system tray, global hotkeys, approval cards, and native notifications on top of the agent loop, 20 built-in tools, persistent memory, and permission engine. 59 tests pass, clippy clean.
+**Current status:** Phase 4 complete — push-to-talk voice with fully local whisper.cpp speech-to-text and native Windows text-to-speech, on top of the native overlay, system tray, agent loop, 20 built-in tools, persistent memory, and permission engine. 69 tests pass, clippy clean.
 
 ### Key features
 
@@ -32,6 +32,7 @@ Think of it as Google Assistant or Siri, but for your desktop, running locally, 
 |---|---|
 | **One binary** | A single `mi.exe` is both the background service and the CLI. No runtime, no admin, nothing else to install. |
 | **Native overlay** | A borderless egui bar appears on hotkey (Ctrl+Shift+M), streams responses, shows tool status chips, and fades away when done. |
+| **Push-to-talk voice** | Hold **Ctrl+Space**, speak, release — mi transcribes locally with whisper.cpp, runs the agent, and speaks the answer back via Windows TTS. Fully local, zero cost, no cloud STT. |
 | **System tray** | mi lives in your system tray with a context menu. Starts at login via Windows Task Scheduler. |
 | **Agent loop with tools** | mi can plan multi-step actions: open apps, manage files, run shell commands, set timers, search the web — all through natural language. |
 | **Approval before anything risky** | Every tool has a risk tier. Reading files is automatic; deleting them asks you first. Always. Approval cards appear in the overlay with Approve / Deny / Always buttons. |
@@ -50,6 +51,7 @@ Think of it as Google Assistant or Siri, but for your desktop, running locally, 
 - **Rust** 1.85+ (edition 2024)
 - A **Gemini API key** — get one at [ai.google.dev](https://ai.google.dev/)
 - **Windows 11** (macOS/Linux adapters planned for Phase 8)
+- **For voice (Phase 4):** [CMake](https://cmake.org/download/) and [LLVM](https://github.com/llvm/llvm-project/releases) (provides `libclang`) are needed at build time to compile whisper.cpp. If they aren't on your `PATH`, point the build at them via [`.cargo/config.toml`](.cargo/config.toml) (`LIBCLANG_PATH` and `CMAKE`). The whisper model (~75 MB `tiny`) downloads automatically to `~/.mi/models/` on first use.
 
 ### Build and run
 
@@ -167,6 +169,13 @@ mi/
 │   │       ├── permissions/
 │   │       │   ├── policy.rs     # Risk tiers, taint tracking
 │   │       │   └── audit.rs      # JSONL audit log
+│   │       ├── voice/
+│   │       │   ├── capture.rs    # Mic capture (cpal), resample to 16 kHz mono
+│   │       │   ├── vad.rs        # Energy-based voice activity detection
+│   │       │   ├── stt.rs        # Local whisper.cpp speech-to-text
+│   │       │   ├── tts.rs        # Windows native text-to-speech (WinRT)
+│   │       │   ├── models.rs     # Whisper GGML model download/management
+│   │       │   └── pipeline.rs   # Mic → VAD → STT → agent → TTS orchestration
 │   │       └── server/
 │   │           └── ws.rs         # axum WebSocket server
 │   └── mi-bin/               # Binary: CLI + overlay entry point
@@ -184,7 +193,8 @@ mi/
     ├── phase-0.md
     ├── phase-1.md
     ├── phase-2.md
-    └── phase-3.md
+    ├── phase-3.md
+    └── phase-4.md
 ```
 
 ---
@@ -218,7 +228,8 @@ mi version                Print version
 | Shortcut | Action |
 |---|---|
 | **Ctrl+Shift+M** | Toggle the overlay (open/close) |
-| **Ctrl+Alt+Esc** | Kill switch — cancel the current agent turn |
+| **Ctrl+Space** | Push-to-talk — hold to listen, release to transcribe and send |
+| **Ctrl+Alt+Esc** | Kill switch — cancel the current agent turn (or stop speaking) |
 | **Enter** | Send message (when overlay is open) |
 | **Escape** | Dismiss the overlay |
 
@@ -330,7 +341,16 @@ local = "llama3.2:3b"
 top_k = 6                     # Max relevant memories injected per turn
 auto_save = "stated_only"      # "off" | "stated_only" | "all"
 embed_dim = 768                # Embedding dimensions (match your embed model)
+
+[voice]
+pipeline = "pipeline"          # "pipeline" (VAD + whisper + TTS) | "live" (future)
+stt_model = "tiny"             # whisper model: "tiny" (~75 MB, fast) | "base" (~150 MB, more accurate)
+silence_timeout_s = 8.0        # seconds of silence before auto-stop recording
+vad_threshold = 0.02           # RMS energy threshold for voice activity
+barge_in = false               # interrupt TTS playback with new speech (future)
 ```
+
+> **Tip:** `tiny` is fast but can mishear words. For better accuracy, set `stt_model = "base"` (or larger) — the model downloads automatically to `~/.mi/models/` on next voice use.
 
 Permission overrides live at `~/.mi/policy.toml`:
 
@@ -382,6 +402,10 @@ Tools that read external content (`files.read`, `web.search`, `web.fetch`) set t
 | Hotkeys | `global-hotkey` 0.10 | System-wide keyboard shortcuts |
 | Notifications | `notify-rust` 4 | Native OS toast notifications |
 | Cancellation | `tokio-util` 0.7 | CancellationToken for kill switch |
+| Audio capture | `cpal` 0.18 | Cross-platform microphone input |
+| Speech-to-text | `whisper-rs` 0.16 | Local whisper.cpp bindings (no cloud STT) |
+| Text-to-speech | `windows` 0.62 | WinRT `SpeechSynthesizer` (native, local) |
+| Audio playback | `rodio` 0.23 | Plays synthesized TTS audio |
 
 No SDK — mi talks to the **Gemini REST API directly** via `reqwest`, including SSE streaming for `streamGenerateContent`.
 
@@ -397,11 +421,13 @@ mi is built in phases. Each phase has clear acceptance criteria and tests that m
 | **1** | Agent loop, tools, permissions — 20 tools, policy engine, taint tracking, audit log, injection tests | ✅ Done |
 | **2** | Memory — SQLite + FTS5 + embeddings, hybrid retrieval, extraction, secret filtering, `mi memory` CLI | ✅ Done |
 | **3** | System presence and overlay — egui overlay bar, tray icon, global hotkeys, approval cards, notifications, autostart | ✅ Done |
-| **4** | Voice — push-to-talk, wake word ("hey mi"), VAD, local STT/TTS | 🔲 Next |
-| **5** | Vision — screenshot tool, screen-ask, image analysis | 🔲 |
+| **4** | Voice — push-to-talk (Ctrl+Space), VAD, local whisper.cpp STT, native Windows TTS | ✅ Done |
+| **5** | Vision — screenshot tool, screen-ask, image analysis | 🔲 Next |
 | **6** | Integrations and scheduling — persistent reminders, Google Calendar/Gmail, Telegram | 🔲 |
 | **7** | Offline mode — Ollama provider, local-first fallback | 🔲 |
 | **8** | Hardening and polish — macOS/Linux, installer scripts, onboarding | 🔲 |
+
+> Phase 4 ships push-to-talk end to end. Wake word ("hey mi"), barge-in, and spoken approvals are tracked as voice follow-ups — see [`docs/phase-4.md`](docs/phase-4.md).
 
 ---
 
@@ -414,7 +440,7 @@ cargo build
 # Build (release)
 cargo build --release
 
-# Run tests (59 pass)
+# Run tests (69 pass)
 cargo test
 
 # Lint

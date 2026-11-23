@@ -32,6 +32,10 @@ pub fn mi_db_path() -> PathBuf {
     mi_dir().join("mi.db")
 }
 
+pub fn mi_models_dir() -> PathBuf {
+    mi_dir().join("models")
+}
+
 pub fn ensure_mi_dir() -> std::io::Result<()> {
     let dir = mi_dir();
     if !dir.exists() {
@@ -40,6 +44,10 @@ pub fn ensure_mi_dir() -> std::io::Result<()> {
     let logs = mi_logs_dir();
     if !logs.exists() {
         std::fs::create_dir_all(&logs)?;
+    }
+    let models = mi_models_dir();
+    if !models.exists() {
+        std::fs::create_dir_all(&models)?;
     }
     Ok(())
 }
@@ -138,6 +146,39 @@ pub enum AutoSave {
     All,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceConfig {
+    #[serde(default = "default_voice_pipeline")]
+    pub pipeline: VoicePipeline,
+    #[serde(default = "default_stt_model")]
+    pub stt_model: String,
+    #[serde(default = "default_silence_timeout")]
+    pub silence_timeout_s: f32,
+    #[serde(default = "default_vad_threshold")]
+    pub vad_threshold: f32,
+    #[serde(default)]
+    pub barge_in: bool,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            pipeline: default_voice_pipeline(),
+            stt_model: default_stt_model(),
+            silence_timeout_s: default_silence_timeout(),
+            vad_threshold: default_vad_threshold(),
+            barge_in: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VoicePipeline {
+    Pipeline,
+    Live,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MiConfig {
     #[serde(default)]
@@ -146,6 +187,8 @@ pub struct MiConfig {
     pub models: ModelsConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub voice: VoiceConfig,
 }
 
 impl MiConfig {
@@ -197,6 +240,18 @@ fn default_auto_save() -> AutoSave {
 }
 fn default_embed_dim() -> usize {
     768
+}
+fn default_voice_pipeline() -> VoicePipeline {
+    VoicePipeline::Pipeline
+}
+fn default_stt_model() -> String {
+    "tiny".into()
+}
+fn default_silence_timeout() -> f32 {
+    8.0
+}
+fn default_vad_threshold() -> f32 {
+    0.02
 }
 
 #[cfg(test)]
