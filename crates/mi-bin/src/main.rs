@@ -14,7 +14,7 @@ use mi_core::agent::loop_runner::{AgentConfig, AgentError, AgentEvent, AgentLoop
 use mi_core::config::{MiConfig, ensure_mi_dir, mi_db_path, mi_logs_dir, mi_quarantine_dir, mi_token_path};
 use mi_core::events::ApprovalDecision;
 use mi_core::llm::gemini::GeminiProvider;
-use mi_core::llm::types::Message;
+use mi_core::llm::types::{ImageData, Message};
 use mi_core::llm::AnyProvider;
 use mi_core::memory::embed::EmbeddingClient;
 use mi_core::memory::extractor::MemoryExtractor;
@@ -240,6 +240,8 @@ async fn backend_loop(
         Text(String),
         PttStart,
         PttStop,
+        ScreenshotAsk,
+        AttachImage { bytes: Vec<u8>, mime: String },
     }
 
     let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel::<BackendMsg>(8);
@@ -273,14 +275,80 @@ async fn backend_loop(
                 UiCommand::PttStop => {
                     let _ = msg_tx.blocking_send(BackendMsg::PttStop);
                 }
+                UiCommand::ScreenshotAsk => {
+                    let _ = msg_tx.blocking_send(BackendMsg::ScreenshotAsk);
+                }
+                UiCommand::AttachImage { bytes, mime } => {
+                    let _ = msg_tx.blocking_send(BackendMsg::AttachImage { bytes, mime });
+                }
                 UiCommand::Quit => break,
             }
         }
     });
 
     // Message handler: runs agent loop per message (text or voice)
+    // Holds an image (screenshot or dropped file) to attach to the next message.
+    let mut pending_image: Option<ImageData> = None;
     while let Some(msg) = msg_rx.recv().await {
         match msg {
+            BackendMsg::ScreenshotAsk => {
+                // Capture the primary monitor now, stash it, then start listening.
+                match tokio::task::spawn_blocking(|| {
+                    mi_core::vision::capture::capture(
+                        mi_core::vision::CaptureTarget::PrimaryMonitor,
+                    )
+                })
+                .await
+                {
+                    Ok(Ok(shot)) => {
+                        pending_image = Some(ImageData {
+                            mime_type: shot.mime_type().to_string(),
+                            data: shot.to_base64(),
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        let _ = event_tx.send(BackendEvent::Error {
+                            message: format!("screen capture: {}", e),
+                        });
+                        egui_ctx.request_repaint();
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(BackendEvent::Error {
+                            message: format!("screen capture task: {}", e),
+                        });
+                        egui_ctx.request_repaint();
+                        continue;
+                    }
+                }
+
+                // Now start listening (same as PttStart).
+                let mut voice_mut = voice.lock().await;
+                if !voice_mut.is_stt_ready()
+                    && let Err(e) = voice_mut.ensure_stt().await
+                {
+                    let _ = event_tx.send(BackendEvent::Error {
+                        message: format!("STT model: {}", e),
+                    });
+                    egui_ctx.request_repaint();
+                    continue;
+                }
+                let _ = event_tx.send(BackendEvent::VoiceListening);
+                egui_ctx.request_repaint();
+                if let Err(e) = voice_mut.start_listening().await {
+                    let _ = event_tx.send(BackendEvent::Error {
+                        message: format!("mic: {}", e),
+                    });
+                    egui_ctx.request_repaint();
+                }
+            }
+            BackendMsg::AttachImage { bytes, mime } => {
+                use base64::Engine;
+                pending_image = Some(ImageData {
+                    mime_type: mime,
+                    data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                });
+            }
             BackendMsg::PttStart => {
                 let voice_guard = voice.lock().await;
                 if !voice_guard.is_stt_ready() {
@@ -339,11 +407,18 @@ async fn backend_loop(
                 let _ = event_tx.send(BackendEvent::VoiceTranscript { text: text.clone() });
                 egui_ctx.request_repaint();
 
-                // Run the agent loop with the transcribed text
+                // Run the agent loop with the transcribed text (plus any attached image).
                 let cancel_token = CancellationToken::new();
                 *cancel_slot.lock().unwrap() = Some(cancel_token.clone());
 
-                let mut agent = create_agent_loop(&api_key, &config, &model);
+                let turn_image = pending_image.take();
+                let turn_model = if turn_image.is_some() {
+                    config.active_vision_model().to_string()
+                } else {
+                    model.clone()
+                };
+
+                let mut agent = create_agent_loop(&api_key, &config, &turn_model);
                 agent.cancel_token = Some(cancel_token);
 
                 let on_event = make_gui_event_callback(event_tx.clone(), egui_ctx.clone());
@@ -353,7 +428,10 @@ async fn backend_loop(
                     approval_slot.clone(),
                 );
 
-                let mut messages = vec![Message::user(&text)];
+                let mut messages = match turn_image {
+                    Some(img) => vec![Message::user_with_images(&text, vec![img])],
+                    None => vec![Message::user(&text)],
+                };
 
                 match agent.run(&mut messages, &on_event, &approve).await {
                     Ok(response_text) => {
@@ -394,7 +472,14 @@ async fn backend_loop(
                 let cancel_token = CancellationToken::new();
                 *cancel_slot.lock().unwrap() = Some(cancel_token.clone());
 
-                let mut agent = create_agent_loop(&api_key, &config, &model);
+                let turn_image = pending_image.take();
+                let turn_model = if turn_image.is_some() {
+                    config.active_vision_model().to_string()
+                } else {
+                    model.clone()
+                };
+
+                let mut agent = create_agent_loop(&api_key, &config, &turn_model);
                 agent.cancel_token = Some(cancel_token);
 
                 let on_event = make_gui_event_callback(event_tx.clone(), egui_ctx.clone());
@@ -404,7 +489,10 @@ async fn backend_loop(
                     approval_slot.clone(),
                 );
 
-                let mut messages = vec![Message::user(&text)];
+                let mut messages = match turn_image {
+                    Some(img) => vec![Message::user_with_images(&text, vec![img])],
+                    None => vec![Message::user(&text)],
+                };
 
                 match agent.run(&mut messages, &on_event, &approve).await {
                     Ok(text) => {

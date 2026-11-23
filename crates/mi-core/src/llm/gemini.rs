@@ -53,10 +53,43 @@ struct Part {
     function_call: Option<GeminiFunctionCall>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "functionResponse")]
     function_response: Option<GeminiFunctionResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "inlineData")]
+    inline_data: Option<InlineData>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "thought")]
     thought: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "thoughtSignature")]
     thought_signature: Option<String>,
+}
+
+impl Part {
+    fn text(text: String) -> Self {
+        Self {
+            text: Some(text),
+            function_call: None,
+            function_response: None,
+            inline_data: None,
+            thought: None,
+            thought_signature: None,
+        }
+    }
+
+    fn image(mime_type: String, data: String) -> Self {
+        Self {
+            text: None,
+            function_call: None,
+            function_response: None,
+            inline_data: Some(InlineData { mime_type, data }),
+            thought: None,
+            thought_signature: None,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct InlineData {
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    data: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -143,6 +176,7 @@ impl GeminiProvider {
                             name: fr.name.clone(),
                             response: serde_json::json!({"result": fr.result}),
                         }),
+                        inline_data: None,
                         thought: None,
                         thought_signature: None,
                     })
@@ -155,13 +189,7 @@ impl GeminiProvider {
             Role::Assistant if !msg.function_calls.is_empty() => {
                 let mut parts = Vec::new();
                 if !msg.text.is_empty() {
-                    parts.push(Part {
-                        text: Some(msg.text.clone()),
-                        function_call: None,
-                        function_response: None,
-                        thought: None,
-                        thought_signature: None,
-                    });
+                    parts.push(Part::text(msg.text.clone()));
                 }
                 for fc in &msg.function_calls {
                     parts.push(Part {
@@ -171,6 +199,7 @@ impl GeminiProvider {
                             args: fc.args.clone(),
                         }),
                         function_response: None,
+                        inline_data: None,
                         thought: None,
                         thought_signature: fc.thought_signature.clone(),
                     });
@@ -182,24 +211,23 @@ impl GeminiProvider {
             }
             Role::Assistant => Content {
                 role: "model".to_string(),
-                parts: vec![Part {
-                    text: Some(msg.text.clone()),
-                    function_call: None,
-                    function_response: None,
-                    thought: None,
-                    thought_signature: None,
-                }],
+                parts: vec![Part::text(msg.text.clone())],
             },
-            Role::User => Content {
-                role: "user".to_string(),
-                parts: vec![Part {
-                    text: Some(msg.text.clone()),
-                    function_call: None,
-                    function_response: None,
-                    thought: None,
-                    thought_signature: None,
-                }],
-            },
+            Role::User => {
+                let mut parts = Vec::new();
+                for img in &msg.images {
+                    parts.push(Part::image(img.mime_type.clone(), img.data.clone()));
+                }
+                // Always include a text part (the question / caption), even
+                // when empty, so an image-only message still has a prompt slot.
+                if !msg.text.is_empty() || parts.is_empty() {
+                    parts.push(Part::text(msg.text.clone()));
+                }
+                Content {
+                    role: "user".to_string(),
+                    parts,
+                }
+            }
         }
     }
 
@@ -227,13 +255,7 @@ impl GeminiProvider {
 
         let system_instruction = system.map(|s| Content {
             role: "user".to_string(),
-            parts: vec![Part {
-                text: Some(s.to_string()),
-                function_call: None,
-                function_response: None,
-                thought: None,
-                thought_signature: None,
-            }],
+            parts: vec![Part::text(s.to_string())],
         });
 
         let tools_payload = tools.map(|decls| {
@@ -416,6 +438,7 @@ mod tests {
             text: String::new(),
             function_calls: vec![FunctionCall::new("system.time", serde_json::json!({}), "c1")],
             function_responses: vec![],
+            images: vec![],
         };
         let content = GeminiProvider::message_to_content(&msg);
         assert_eq!(content.role, "model");

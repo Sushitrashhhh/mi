@@ -11,6 +11,10 @@ pub enum UiCommand {
     CancelTurn,
     PttStart,
     PttStop,
+    /// Ctrl+Shift+S: capture the screen now, then listen for a spoken question.
+    ScreenshotAsk,
+    /// An image file was dropped on the overlay; attach it to the next message.
+    AttachImage { bytes: Vec<u8>, mime: String },
     Quit,
 }
 

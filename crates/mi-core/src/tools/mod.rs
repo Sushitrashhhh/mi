@@ -45,6 +45,7 @@ impl ToolExecutor {
             "timers.set" => builtin::timers::set(args, &self.timers).await,
             "timers.list" => builtin::timers::list(&self.timers).await,
             "timers.cancel" => builtin::timers::cancel(args, &self.timers).await,
+            "screen.capture" => builtin::screen::capture_tool(args).await,
             _ => ToolResult::error(format!("unknown tool: {}", name)),
         }
     }

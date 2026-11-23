@@ -5,6 +5,7 @@ pub struct HotkeyIds {
     pub type_mode: u32,
     pub kill_switch: u32,
     pub ptt: u32,
+    pub screenshot_ask: u32,
 }
 
 pub fn register_hotkeys() -> Result<(GlobalHotKeyManager, HotkeyIds), global_hotkey::Error> {
@@ -19,12 +20,16 @@ pub fn register_hotkeys() -> Result<(GlobalHotKeyManager, HotkeyIds), global_hot
     let ptt = HotKey::new(Some(Modifiers::CONTROL), Code::Space);
     manager.register(ptt)?;
 
+    let screenshot_ask = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
+    manager.register(screenshot_ask)?;
+
     Ok((
         manager,
         HotkeyIds {
             type_mode: type_mode.id(),
             kill_switch: kill_switch.id(),
             ptt: ptt.id(),
+            screenshot_ask: screenshot_ask.id(),
         },
     ))
 }

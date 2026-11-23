@@ -198,6 +198,30 @@ pub enum TtsBackend {
     Kelados,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacyConfig {
+    /// Keep captured screenshots on disk. Default false — screenshots live only
+    /// in memory for the duration of the turn.
+    #[serde(default)]
+    pub keep_screenshots: bool,
+    /// Redact sensitive regions before sending a screenshot (not yet implemented).
+    #[serde(default = "default_redact_screenshots")]
+    pub redact_screenshots: bool,
+    /// Retention window (days) for anything that is persisted.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            keep_screenshots: false,
+            redact_screenshots: default_redact_screenshots(),
+            retention_days: default_retention_days(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MiConfig {
     #[serde(default)]
@@ -208,6 +232,8 @@ pub struct MiConfig {
     pub memory: MemoryConfig,
     #[serde(default)]
     pub voice: VoiceConfig,
+    #[serde(default)]
+    pub privacy: PrivacyConfig,
 }
 
 impl MiConfig {
@@ -235,6 +261,16 @@ impl MiConfig {
             &self.models.fast
         } else {
             ""
+        }
+    }
+
+    /// Model to use when a turn includes an image. Prefers `models.vision`,
+    /// falling back to the default model (modern Gemini models are multimodal).
+    pub fn active_vision_model(&self) -> &str {
+        if !self.models.vision.is_empty() {
+            &self.models.vision
+        } else {
+            self.active_model()
         }
     }
 }
@@ -280,6 +316,12 @@ fn default_tts_voice() -> String {
 }
 fn default_kelados_url() -> String {
     "http://127.0.0.1:8880".into()
+}
+fn default_redact_screenshots() -> bool {
+    true
+}
+fn default_retention_days() -> u32 {
+    90
 }
 
 #[cfg(test)]

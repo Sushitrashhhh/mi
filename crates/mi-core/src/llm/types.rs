@@ -18,6 +18,15 @@ pub struct FunctionResponse {
     pub result: String,
 }
 
+/// An image attached to a message, sent to the model as `inline_data`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageData {
+    /// e.g. "image/png"
+    pub mime_type: String,
+    /// base64-encoded image bytes
+    pub data: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
@@ -27,6 +36,8 @@ pub struct Message {
     pub function_calls: Vec<FunctionCall>,
     #[serde(default)]
     pub function_responses: Vec<FunctionResponse>,
+    #[serde(default)]
+    pub images: Vec<ImageData>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,6 +86,17 @@ impl Message {
             text: text.to_string(),
             function_calls: vec![],
             function_responses: vec![],
+            images: vec![],
+        }
+    }
+
+    pub fn user_with_images(text: &str, images: Vec<ImageData>) -> Self {
+        Self {
+            role: Role::User,
+            text: text.to_string(),
+            function_calls: vec![],
+            function_responses: vec![],
+            images,
         }
     }
 
@@ -84,6 +106,7 @@ impl Message {
             text: text.to_string(),
             function_calls: vec![],
             function_responses: vec![],
+            images: vec![],
         }
     }
 
@@ -97,6 +120,7 @@ impl Message {
                 name: name.to_string(),
                 result: result.to_string(),
             }],
+            images: vec![],
         }
     }
 }

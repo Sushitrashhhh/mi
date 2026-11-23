@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::llm::types::ImageData;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Tier {
@@ -36,6 +38,10 @@ pub struct ToolDef {
 pub struct ToolResult {
     pub ok: bool,
     pub content: String,
+    /// Images produced by the tool (e.g. a screenshot), injected into the
+    /// conversation as a follow-up user message so the model can see them.
+    #[serde(default)]
+    pub images: Vec<ImageData>,
 }
 
 impl ToolResult {
@@ -43,6 +49,7 @@ impl ToolResult {
         Self {
             ok: true,
             content: content.into(),
+            images: vec![],
         }
     }
 
@@ -50,6 +57,15 @@ impl ToolResult {
         Self {
             ok: false,
             content: content.into(),
+            images: vec![],
+        }
+    }
+
+    pub fn ok_with_images(content: impl Into<String>, images: Vec<ImageData>) -> Self {
+        Self {
+            ok: true,
+            content: content.into(),
+            images,
         }
     }
 }

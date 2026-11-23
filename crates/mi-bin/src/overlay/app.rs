@@ -191,8 +191,51 @@ impl MiOverlay {
                         self.phase = Phase::Done;
                         self.done_at = Some(Instant::now());
                     }
+                } else if event.id == self.hotkey_ids.screenshot_ask
+                    && (self.phase == Phase::Hidden
+                        || self.phase == Phase::Done
+                        || self.phase == Phase::Input)
+                {
+                    // Capture the screen now (before the overlay covers it), then listen.
+                    self.show(ctx);
+                    self.phase = Phase::Listening;
+                    self.response_text.clear();
+                    self.tool_chips.clear();
+                    self.last_error = None;
+                    let _ = self.cmd_tx.send(UiCommand::ScreenshotAsk);
                 }
             }
+        }
+    }
+
+    fn poll_dropped_images(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        for file in dropped {
+            let ext = file
+                .path()
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase());
+            let mime = match ext.as_deref() {
+                Some("png") => "image/png",
+                Some("jpg" | "jpeg") => "image/jpeg",
+                Some("webp") => "image/webp",
+                Some("gif") => "image/gif",
+                _ => continue, // not an image we support
+            };
+            let bytes = match file.bytes() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            self.show(ctx);
+            if self.phase == Phase::Hidden || self.phase == Phase::Done {
+                self.phase = Phase::Input;
+            }
+            self.last_error = Some("image attached — type or speak your question".into());
+            let _ = self.cmd_tx.send(UiCommand::AttachImage {
+                bytes,
+                mime: mime.to_string(),
+            });
         }
     }
 
@@ -725,7 +768,7 @@ impl MiOverlay {
     fn render_footer(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let hints = match self.phase {
-                Phase::Input => "Enter to send \u{00B7} Ctrl+Space to talk \u{00B7} Esc to close",
+                Phase::Input => "Enter to send \u{00B7} Ctrl+Space talk \u{00B7} Ctrl+Shift+S screen \u{00B7} Esc close",
                 Phase::Listening => "release Ctrl+Space to send",
                 Phase::Transcribing => "transcribing speech...",
                 Phase::Thinking | Phase::Responding => "Ctrl+Alt+Esc to cancel",
@@ -752,6 +795,7 @@ impl eframe::App for MiOverlay {
 
         self.poll_tray_events(ctx);
         self.poll_hotkey_events(ctx);
+        self.poll_dropped_images(ctx);
         self.poll_backend_events(ctx);
 
         if self.phase == Phase::Done

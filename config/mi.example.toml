@@ -23,3 +23,8 @@ barge_in = false               # interrupt TTS playback with new speech
 tts_backend = "kelados"        # "kelados" (Kokoro voices, needs `npx kelados serve`) | "windows"
 tts_voice = "af_heart"         # Kokoro voice id, e.g. af_heart, af_bella, bf_emma (female); am_michael (male)
 kelados_url = "http://127.0.0.1:8880"  # local Kelados TTS server; falls back to Windows voice if down
+
+[privacy]
+keep_screenshots = false       # keep captured screenshots on disk (default: in-memory only)
+redact_screenshots = true      # redact sensitive regions before sending (not yet implemented)
+retention_days = 90            # retention window for anything that is persisted

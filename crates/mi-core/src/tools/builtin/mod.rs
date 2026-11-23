@@ -1,5 +1,6 @@
 pub mod apps;
 pub mod files;
+pub mod screen;
 pub mod shell;
 pub mod system;
 pub mod timers;
@@ -14,4 +15,5 @@ pub fn register_all(registry: &mut ToolRegistry) {
     shell::register(registry);
     web::register(registry);
     timers::register(registry);
+    screen::register(registry);
 }

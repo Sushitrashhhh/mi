@@ -169,9 +169,11 @@ impl AgentLoop {
                 text: text.clone(),
                 function_calls: function_calls.clone(),
                 function_responses: vec![],
+                images: vec![],
             });
 
             let mut responses = Vec::new();
+            let mut captured_images = Vec::new();
 
             for fc in &function_calls {
                 let def = self.registry.get(&fc.name);
@@ -250,6 +252,8 @@ impl AgentLoop {
                     taint.tainted = true;
                 }
 
+                captured_images.extend(result.images);
+
                 responses.push(FunctionResponse {
                     call_id: fc.call_id.clone(),
                     name: fc.name.clone(),
@@ -262,7 +266,17 @@ impl AgentLoop {
                 text: String::new(),
                 function_calls: vec![],
                 function_responses: responses,
+                images: vec![],
             });
+
+            // If any tool produced images (e.g. a screenshot), attach them as a
+            // follow-up user message so the model can see them on the next step.
+            if !captured_images.is_empty() {
+                messages.push(Message::user_with_images(
+                    "Here is the captured image.",
+                    captured_images,
+                ));
+            }
         }
 
         Err(AgentError::MaxSteps)

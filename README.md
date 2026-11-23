@@ -24,7 +24,7 @@
 
 Think of it as Google Assistant or Siri, but for your desktop, running locally, and you own every byte of your data.
 
-**Current status:** Phase 4 complete — push-to-talk voice with fully local whisper.cpp speech-to-text and native Windows text-to-speech, on top of the native overlay, system tray, agent loop, 20 built-in tools, persistent memory, and permission engine. 69 tests pass, clippy clean.
+**Current status:** Phase 5 complete — vision: capture the screen (or active window) and ask about it by voice, text, or drag-and-drop, with screenshots kept in memory only and screen content tainting the turn. On top of push-to-talk voice (local whisper.cpp STT + Kokoro/Windows TTS), the native overlay, system tray, agent loop, 21 built-in tools, persistent memory, and permission engine. 69 tests pass, clippy clean.
 
 ### Key features
 
@@ -33,6 +33,7 @@ Think of it as Google Assistant or Siri, but for your desktop, running locally, 
 | **One binary** | A single `mi.exe` is both the background service and the CLI. No runtime, no admin, nothing else to install. |
 | **Native overlay** | A borderless egui bar appears on hotkey (Ctrl+Shift+M), streams responses, shows tool status chips, and fades away when done. |
 | **Push-to-talk voice** | Hold **Ctrl+Space**, speak, release — mi transcribes locally with whisper.cpp, runs the agent, and speaks the answer back. Natural Kokoro voices via a local [Kelados](https://kelados.in/) server (with automatic fallback to the native Windows voice). Fully local, zero cost, no cloud STT/TTS. |
+| **Vision** | "What's this error on my screen?" — mi captures your screen (or active window) and explains it. Trigger by voice/text (`screen.capture` tool), **Ctrl+Shift+S** (capture then speak), or by dragging an image onto the overlay. Screenshots stay in memory (never written to disk), and screen content taints the turn so risky actions still ask first. |
 | **System tray** | mi lives in your system tray with a context menu. Starts at login via Windows Task Scheduler. |
 | **Agent loop with tools** | mi can plan multi-step actions: open apps, manage files, run shell commands, set timers, search the web — all through natural language. |
 | **Approval before anything risky** | Every tool has a risk tier. Reading files is automatic; deleting them asks you first. Always. Approval cards appear in the overlay with Approve / Deny / Always buttons. |
@@ -174,8 +175,12 @@ mi/
 │   │       │   ├── vad.rs        # Energy-based voice activity detection
 │   │       │   ├── stt.rs        # Local whisper.cpp speech-to-text
 │   │       │   ├── tts.rs        # Windows native text-to-speech (WinRT)
+│   │       │   ├── tts_kelados.rs # Kokoro TTS via local Kelados HTTP server
 │   │       │   ├── models.rs     # Whisper GGML model download/management
 │   │       │   └── pipeline.rs   # Mic → VAD → STT → agent → TTS orchestration
+│   │       ├── vision/
+│   │       │   ├── capture.rs    # xcap screen/window capture → in-memory PNG
+│   │       │   └── mod.rs        # CaptureTarget, VisionError
 │   │       └── server/
 │   │           └── ws.rs         # axum WebSocket server
 │   └── mi-bin/               # Binary: CLI + overlay entry point
@@ -194,7 +199,8 @@ mi/
     ├── phase-1.md
     ├── phase-2.md
     ├── phase-3.md
-    └── phase-4.md
+    ├── phase-4.md
+    └── phase-5.md
 ```
 
 ---
@@ -229,6 +235,7 @@ mi version                Print version
 |---|---|
 | **Ctrl+Shift+M** | Toggle the overlay (open/close) |
 | **Ctrl+Space** | Push-to-talk — hold to listen, release to transcribe and send |
+| **Ctrl+Shift+S** | Screenshot-ask — capture the screen, then speak your question |
 | **Ctrl+Alt+Esc** | Kill switch — cancel the current agent turn (or stop speaking) |
 | **Enter** | Send message (when overlay is open) |
 | **Escape** | Dismiss the overlay |
@@ -371,7 +378,7 @@ always_approve = []
 
 ## Built-in tools
 
-mi ships with **20 tools** across 6 packs:
+mi ships with **21 tools** across 7 packs:
 
 | Pack | Tools | Tier |
 |---|---|---|
@@ -381,8 +388,9 @@ mi ships with **20 tools** across 6 packs:
 | **shell** | `shell.run` | CONFIRM |
 | **web** | `web.search`, `web.fetch` | READ (taints) |
 | **timers** | `timers.set`, `timers.list`, `timers.cancel` | SAFE/READ |
+| **screen** | `screen.capture` | READ (taints) |
 
-Tools that read external content (`files.read`, `web.search`, `web.fetch`) set the **taint flag**, which escalates subsequent `SAFE` tools to `CONFIRM`.
+Tools that read external content (`files.read`, `web.search`, `web.fetch`, `screen.capture`) set the **taint flag**, which escalates subsequent `SAFE` tools to `CONFIRM`.
 
 ---
 
@@ -411,6 +419,8 @@ Tools that read external content (`files.read`, `web.search`, `web.fetch`) set t
 | Speech-to-text | `whisper-rs` 0.16 | Local whisper.cpp bindings (no cloud STT) |
 | Text-to-speech | Kelados (Kokoro) / `windows` 0.62 | Local Kokoro voices over HTTP, with WinRT `SpeechSynthesizer` fallback |
 | Audio playback | `rodio` 0.23 | Plays synthesized TTS audio |
+| Screen capture | `xcap` 0.9 | Screenshot of monitor / active window (Vision) |
+| Image encode | `image` 0.25 (png) + `base64` 0.22 | PNG-encode and base64 screenshots for the model |
 
 No SDK — mi talks to the **Gemini REST API directly** via `reqwest`, including SSE streaming for `streamGenerateContent`.
 
@@ -426,9 +436,9 @@ mi is built in phases. Each phase has clear acceptance criteria and tests that m
 | **1** | Agent loop, tools, permissions — 20 tools, policy engine, taint tracking, audit log, injection tests | ✅ Done |
 | **2** | Memory — SQLite + FTS5 + embeddings, hybrid retrieval, extraction, secret filtering, `mi memory` CLI | ✅ Done |
 | **3** | System presence and overlay — egui overlay bar, tray icon, global hotkeys, approval cards, notifications, autostart | ✅ Done |
-| **4** | Voice — push-to-talk (Ctrl+Space), VAD, local whisper.cpp STT, native Windows TTS | ✅ Done |
-| **5** | Vision — screenshot tool, screen-ask, image analysis | 🔲 Next |
-| **6** | Integrations and scheduling — persistent reminders, Google Calendar/Gmail, Telegram | 🔲 |
+| **4** | Voice — push-to-talk (Ctrl+Space), VAD, local whisper.cpp STT, Kokoro/Windows TTS | ✅ Done |
+| **5** | Vision — `screen.capture` tool, Ctrl+Shift+S screenshot-ask, image drop, taint, in-memory only | ✅ Done |
+| **6** | Integrations and scheduling — persistent reminders, Google Calendar/Gmail, Telegram | 🔲 Next |
 | **7** | Offline mode — Ollama provider, local-first fallback | 🔲 |
 | **8** | Hardening and polish — macOS/Linux, installer scripts, onboarding | 🔲 |
 
