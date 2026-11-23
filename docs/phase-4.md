@@ -26,11 +26,17 @@
 - Supports any model size: tiny, base, small, medium, large
 - Default: `tiny` (~75 MB, fastest)
 
-### Windows native TTS (`mi-core/voice/tts.rs`)
-- Uses `windows` 0.62 WinRT `SpeechSynthesizer` — free, local, zero cost
-- Synthesizes text to WAV bytes via `SynthesizeTextToStreamAsync`
-- Blocks on WinRT async via `futures::executor::block_on`
-- Non-Windows stub returns error gracefully
+### Text-to-speech (`mi-core/voice/tts.rs`, `tts_kelados.rs`)
+Two selectable backends (`voice.tts_backend` in config), both local and free:
+- **Kelados / Kokoro** (`tts_kelados.rs`, default): HTTP client (`reqwest`) to a local
+  Kelados server (`npx kelados serve`, default `127.0.0.1:8880`) exposing an
+  OpenAI-compatible `POST /v1/audio/speech`. Returns 24 kHz WAV. Natural Kokoro
+  voices (default `af_heart`, a Grade-A female voice). If the server is unreachable,
+  the pipeline **falls back to Windows TTS** automatically.
+- **Windows native** (`tts.rs`): `windows` 0.62 WinRT `SpeechSynthesizer`, prefers a
+  female voice (Zira/Aria). Synthesizes to WAV via `SynthesizeTextToStreamAsync`,
+  blocking on WinRT async with `futures::executor::block_on`. Non-Windows stub errors
+  gracefully.
 
 ### Voice pipeline (`mi-core/voice/pipeline.rs`)
 - Orchestrates: Mic → VAD → Whisper STT → Agent Loop → Windows TTS → Playback

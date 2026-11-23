@@ -2,12 +2,13 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::config::VoiceConfig;
+use crate::config::{TtsBackend, VoiceConfig};
 
 use super::capture::{AudioCapture, RecordingHandle};
 use super::models;
 use super::stt::WhisperStt;
 use super::tts::WindowsTts;
+use super::tts_kelados::KeladosTts;
 use super::vad::{VadEvent, VoiceActivityDetector};
 use super::VoiceError;
 
@@ -21,7 +22,8 @@ pub enum VoiceState {
 
 pub struct VoicePipeline {
     stt: Option<Arc<WhisperStt>>,
-    tts: Option<Arc<WindowsTts>>,
+    tts_windows: Option<Arc<WindowsTts>>,
+    tts_kelados: Option<Arc<KeladosTts>>,
     capture: Option<Arc<AudioCapture>>,
     recording: Arc<Mutex<Option<RecordingHandle>>>,
     vad: Arc<Mutex<VoiceActivityDetector>>,
@@ -35,7 +37,8 @@ impl VoicePipeline {
 
         Self {
             stt: None,
-            tts: None,
+            tts_windows: None,
+            tts_kelados: None,
             capture: None,
             recording: Arc::new(Mutex::new(None)),
             vad: Arc::new(Mutex::new(vad)),
@@ -54,9 +57,20 @@ impl VoicePipeline {
             self.stt = Some(Arc::new(stt));
         }
 
+        // Always set up Windows TTS as a local fallback.
         match WindowsTts::new() {
-            Ok(tts) => self.tts = Some(Arc::new(tts)),
-            Err(e) => tracing::warn!("TTS init failed (will work without voice output): {}", e),
+            Ok(tts) => self.tts_windows = Some(Arc::new(tts)),
+            Err(e) => tracing::warn!("Windows TTS init failed: {}", e),
+        }
+
+        // Kelados is a network client; creating it does no I/O (server is
+        // contacted lazily on first `speak`).
+        if self.config.tts_backend == TtsBackend::Kelados {
+            let kelados = KeladosTts::new(
+                self.config.kelados_url.clone(),
+                self.config.tts_voice.clone(),
+            );
+            self.tts_kelados = Some(Arc::new(kelados));
         }
 
         Ok(())
@@ -78,7 +92,7 @@ impl VoicePipeline {
     }
 
     pub fn is_tts_ready(&self) -> bool {
-        self.tts.is_some()
+        self.tts_windows.is_some() || self.tts_kelados.is_some()
     }
 
     pub fn is_model_downloaded(&self) -> bool {
@@ -137,21 +151,37 @@ impl VoicePipeline {
     }
 
     pub async fn speak(&self, text: &str) -> Result<Vec<u8>, VoiceError> {
-        let tts = self.tts.as_ref().ok_or(VoiceError::Synthesis(
-            "TTS not initialized".into(),
-        ))?;
-
         *self.state.lock().await = VoiceState::Speaking;
 
-        let tts = tts.clone();
-        let text = text.to_string();
-        let wav = tokio::task::spawn_blocking(move || tts.synthesize_to_wav(&text))
-            .await
-            .map_err(|e| VoiceError::Synthesis(format!("task join error: {}", e)))?
-            ?;
+        // Prefer Kelados (Kokoro voices) when configured; fall back to the
+        // native Windows voice if its server isn't reachable.
+        let result = if self.config.tts_backend == TtsBackend::Kelados
+            && let Some(kelados) = self.tts_kelados.clone()
+        {
+            match kelados.synthesize_to_wav(text).await {
+                Ok(wav) => Ok(wav),
+                Err(e) => {
+                    tracing::warn!("Kelados TTS failed ({}); falling back to Windows voice", e);
+                    self.speak_windows(text).await
+                }
+            }
+        } else {
+            self.speak_windows(text).await
+        };
 
         *self.state.lock().await = VoiceState::Idle;
-        Ok(wav)
+        result
+    }
+
+    async fn speak_windows(&self, text: &str) -> Result<Vec<u8>, VoiceError> {
+        let tts = self
+            .tts_windows
+            .clone()
+            .ok_or_else(|| VoiceError::Synthesis("no TTS backend available".into()))?;
+        let text = text.to_string();
+        tokio::task::spawn_blocking(move || tts.synthesize_to_wav(&text))
+            .await
+            .map_err(|e| VoiceError::Synthesis(format!("task join error: {}", e)))?
     }
 
     pub async fn check_vad(&self) -> VadEvent {

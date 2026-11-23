@@ -20,3 +20,6 @@ stt_model = "tiny"             # whisper model size: "tiny" (~75MB) | "base" (~1
 silence_timeout_s = 8.0        # seconds of silence before auto-stop recording
 vad_threshold = 0.02           # RMS energy threshold for voice activity
 barge_in = false               # interrupt TTS playback with new speech
+tts_backend = "kelados"        # "kelados" (Kokoro voices, needs `npx kelados serve`) | "windows"
+tts_voice = "af_heart"         # Kokoro voice id, e.g. af_heart, af_bella, bf_emma (female); am_michael (male)
+kelados_url = "http://127.0.0.1:8880"  # local Kelados TTS server; falls back to Windows voice if down

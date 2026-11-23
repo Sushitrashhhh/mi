@@ -3,6 +3,7 @@ pub mod models;
 pub mod pipeline;
 pub mod stt;
 pub mod tts;
+pub mod tts_kelados;
 pub mod vad;
 
 use thiserror::Error;

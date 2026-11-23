@@ -158,6 +158,12 @@ pub struct VoiceConfig {
     pub vad_threshold: f32,
     #[serde(default)]
     pub barge_in: bool,
+    #[serde(default = "default_tts_backend")]
+    pub tts_backend: TtsBackend,
+    #[serde(default = "default_tts_voice")]
+    pub tts_voice: String,
+    #[serde(default = "default_kelados_url")]
+    pub kelados_url: String,
 }
 
 impl Default for VoiceConfig {
@@ -168,6 +174,9 @@ impl Default for VoiceConfig {
             silence_timeout_s: default_silence_timeout(),
             vad_threshold: default_vad_threshold(),
             barge_in: false,
+            tts_backend: default_tts_backend(),
+            tts_voice: default_tts_voice(),
+            kelados_url: default_kelados_url(),
         }
     }
 }
@@ -177,6 +186,16 @@ impl Default for VoiceConfig {
 pub enum VoicePipeline {
     Pipeline,
     Live,
+}
+
+/// Which text-to-speech engine to use.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsBackend {
+    /// Native Windows WinRT SpeechSynthesizer (local, no extra process).
+    Windows,
+    /// Kelados local server (Kokoro voices) over HTTP; needs `npx kelados serve`.
+    Kelados,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -252,6 +271,15 @@ fn default_silence_timeout() -> f32 {
 }
 fn default_vad_threshold() -> f32 {
     0.02
+}
+fn default_tts_backend() -> TtsBackend {
+    TtsBackend::Kelados
+}
+fn default_tts_voice() -> String {
+    "af_heart".into()
+}
+fn default_kelados_url() -> String {
+    "http://127.0.0.1:8880".into()
 }
 
 #[cfg(test)]

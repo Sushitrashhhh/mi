@@ -32,7 +32,7 @@ Think of it as Google Assistant or Siri, but for your desktop, running locally, 
 |---|---|
 | **One binary** | A single `mi.exe` is both the background service and the CLI. No runtime, no admin, nothing else to install. |
 | **Native overlay** | A borderless egui bar appears on hotkey (Ctrl+Shift+M), streams responses, shows tool status chips, and fades away when done. |
-| **Push-to-talk voice** | Hold **Ctrl+Space**, speak, release — mi transcribes locally with whisper.cpp, runs the agent, and speaks the answer back via Windows TTS. Fully local, zero cost, no cloud STT. |
+| **Push-to-talk voice** | Hold **Ctrl+Space**, speak, release — mi transcribes locally with whisper.cpp, runs the agent, and speaks the answer back. Natural Kokoro voices via a local [Kelados](https://kelados.in/) server (with automatic fallback to the native Windows voice). Fully local, zero cost, no cloud STT/TTS. |
 | **System tray** | mi lives in your system tray with a context menu. Starts at login via Windows Task Scheduler. |
 | **Agent loop with tools** | mi can plan multi-step actions: open apps, manage files, run shell commands, set timers, search the web — all through natural language. |
 | **Approval before anything risky** | Every tool has a risk tier. Reading files is automatic; deleting them asks you first. Always. Approval cards appear in the overlay with Approve / Deny / Always buttons. |
@@ -348,9 +348,14 @@ stt_model = "tiny"             # whisper model: "tiny" (~75 MB, fast) | "base" (
 silence_timeout_s = 8.0        # seconds of silence before auto-stop recording
 vad_threshold = 0.02           # RMS energy threshold for voice activity
 barge_in = false               # interrupt TTS playback with new speech (future)
+tts_backend = "kelados"        # "kelados" (Kokoro voices) | "windows" (native WinRT)
+tts_voice = "af_heart"         # Kokoro voice id (af_heart/af_bella = sweet female, am_michael = male)
+kelados_url = "http://127.0.0.1:8880"  # local Kelados server; falls back to Windows voice if unreachable
 ```
 
-> **Tip:** `tiny` is fast but can mishear words. For better accuracy, set `stt_model = "base"` (or larger) — the model downloads automatically to `~/.mi/models/` on next voice use.
+> **STT accuracy:** `tiny` is fast but can mishear words. For better accuracy set `stt_model = "base"` (or larger) — the model downloads automatically to `~/.mi/models/` on next voice use.
+>
+> **Kokoro voices (TTS):** with `tts_backend = "kelados"`, start the local voice server once with `npx kelados serve` (needs Node 20+; downloads an ~90 MB Kokoro model on first run). mi calls it over HTTP for natural voices and **automatically falls back to the native Windows voice if the server isn't running**. Set `tts_backend = "windows"` to skip Kelados entirely. All audio stays on your machine — nothing is sent to the cloud.
 
 Permission overrides live at `~/.mi/policy.toml`:
 
@@ -404,7 +409,7 @@ Tools that read external content (`files.read`, `web.search`, `web.fetch`) set t
 | Cancellation | `tokio-util` 0.7 | CancellationToken for kill switch |
 | Audio capture | `cpal` 0.18 | Cross-platform microphone input |
 | Speech-to-text | `whisper-rs` 0.16 | Local whisper.cpp bindings (no cloud STT) |
-| Text-to-speech | `windows` 0.62 | WinRT `SpeechSynthesizer` (native, local) |
+| Text-to-speech | Kelados (Kokoro) / `windows` 0.62 | Local Kokoro voices over HTTP, with WinRT `SpeechSynthesizer` fallback |
 | Audio playback | `rodio` 0.23 | Plays synthesized TTS audio |
 
 No SDK — mi talks to the **Gemini REST API directly** via `reqwest`, including SSE streaming for `streamGenerateContent`.
